@@ -1,22 +1,15 @@
-
-
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, Request
 import redis
 import json
 
 app = FastAPI()
+r = redis.Redis(host='localhost', port=6379, db=0)
 
-# Подключение к Redis
-redis_client = redis.Redis(host="localhost", port=6379, db=0)
-
-class Event(BaseModel):
-    user_id: int
-    action: str
-    timestamp: int
+QUEUE_KEY = "events:queue"
 
 @app.post("/event")
-def receive_event(event: Event):
-    event_data = event.dict()
-    redis_client.rpush("event_queue", json.dumps(event_data))
+async def receive_event(request: Request):
+    event = await request.json()
+    r.rpush(QUEUE_KEY, json.dumps(event))
     return {"status": "accepted"}
+
