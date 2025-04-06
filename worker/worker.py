@@ -1,26 +1,31 @@
-import redis
+import asyncio
 import json
-import time
-from deduplicator.redis_deduplicator import RedisDeduplicator
+import redis.asyncio as redis
+from deduplicator.deduplicator import Deduplicator
 
-r = redis.Redis(host='localhost', port=6379, db=0)
 QUEUE_KEY = "events:queue"
 
-dedup = RedisDeduplicator(r, key_fields=["user_id", "action", "timestamp"])
+redis_client = redis.Redis(host='localhost', port=6379, db=0)
+dedup = Deduplicator(redis=redis_client)
 
-def process(event):
+async def process(event: dict):
     print(f"✅ Обрабатываем уникальное событие: {event}")
-    # Логика обработки события (например, логирование или другие действия)
+    # Здесь может быть логика сохранения в БД, логирования и т.п.
 
-print("Воркер запущен и ожидает событий...")  # Строка для отладки
+async def worker_loop():
+    print("🚀 Воркер запущен и ожидает событий...")
+    while True:
+        result = await redis_client.blpop(QUEUE_KEY, timeout=1)
+        if result:
+            _, raw = result
+            event = json.loads(raw)
 
-while True:
-    _, raw = r.blpop(QUEUE_KEY)  # Блокирующее ожидание
-    event = json.loads(raw)
+            if await dedup.is_unique(event):
+                await process(event)
+            else:
+                print(f"⛔ Дубликат события: {event}")
 
-    if dedup.add(event):
-        process(event)
-    else:
-        print(f"⛔ Дубликат: {event}")
+        await asyncio.sleep(0.01)
 
-    time.sleep(0.01)  # чтобы не крутилось слишком быстро
+if __name__ == "__main__":
+    asyncio.run(worker_loop())
