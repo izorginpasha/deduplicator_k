@@ -9,7 +9,7 @@ redis_client = redis.Redis(host='localhost', port=6379, db=0)
 dedup = Deduplicator(redis=redis_client)
 
 async def process(event: dict):
-    print(f"✅ Обрабатываем уникальное событие: {event}")
+    print(f"✅ Обрабатываем уникальное событие: ")
     # Здесь может быть логика сохранения в БД, логирования и т.п.
 
 async def worker_loop():
@@ -23,7 +23,7 @@ async def worker_loop():
             if await dedup.is_unique(event):
                 await process(event)
             else:
-                print(f"⛔ Дубликат события: {event}")
+                print(f"⛔ Дубликат события: ")
 
         await asyncio.sleep(0.01)
 

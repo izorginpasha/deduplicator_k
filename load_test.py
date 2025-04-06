@@ -3,8 +3,12 @@ import httpx
 from locust import HttpUser, task, between
 
 # Загрузка JSON данных
-with open('results-1743680955719.json', 'r') as f:
+
+file_path = 'results-1743680955719.json'
+
+with open(file_path, 'r', encoding='utf-8') as f:
     events = json.load(f)
+
 
 class EventLoadTest(HttpUser):
     wait_time = between(1, 2)  # Задержка между запросами (1-2 секунды)
@@ -20,4 +24,3 @@ class EventLoadTest(HttpUser):
         # Функция для случайного выбора события из списка
         import random
         return random.randint(0, len(events) - 1)
-
