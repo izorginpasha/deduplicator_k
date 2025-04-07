@@ -1,26 +1,44 @@
 import json
+import random
+import redis
 import httpx
-from locust import HttpUser, task, between
+from locust import HttpUser, task, between, events
 
-# Загрузка JSON данных
+# Конфигурация
+REDIS_HOST = 'localhost'
+REDIS_PORT = 6379
+QUEUE_KEY = 'events:queue'
+EVENT_FILE = 'results-1743680955719.json'
 
-file_path = 'results-1743680955719.json'
-
-with open(file_path, 'r', encoding='utf-8') as f:
+# Загружаем события из файла
+with open(EVENT_FILE, 'r', encoding='utf-8') as f:
     events = json.load(f)
+
+# Redis sync клиент (используем sync, потому что Locust — sync)
+redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
+
+
+def reset_redis_and_push_events():
+    print("🔄 Очищаем Redis и загружаем события в очередь...")
+    redis_client.flushdb()
+    for event in events:
+        redis_client.rpush(QUEUE_KEY, json.dumps(event))
+    print(f"✅ Загружено {len(events)} событий в очередь")
+
+
+@events.test_start.add_listener
+def on_test_start(environment, **kwargs):
+    reset_redis_and_push_events()
 
 
 class EventLoadTest(HttpUser):
-    wait_time = between(1, 2)  # Задержка между запросами (1-2 секунды)
+    wait_time = between(0, 0)
 
     @task
     def post_event(self):
-        event = events[self.random_event_index()]
-        response = self.client.post("/event", json=event)
-        if response.status_code != 200:
-            print(f"Ошибка при отправке события: {response.status_code}")
-
-    def random_event_index(self):
-        # Функция для случайного выбора события из списка
-        import random
-        return random.randint(0, len(events) - 1)
+        event = random.choice(events)
+        with self.client.post("/event", json=event, catch_response=True) as response:
+            if response.status_code != 200:
+                response.failure(f"❌ Ошибка: {response.status_code} — {response.text}")
+            else:
+                response.success()
