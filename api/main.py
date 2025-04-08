@@ -1,19 +1,23 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import json
+import os
 import httpx
 from kafka import KafkaProducer
 import uuid
 from api.models.event import Event
+from dotenv import load_dotenv
+load_dotenv()
 
+# Очередь для отправки событий
+EVENT_TOPIC = os.getenv("TOPIC")
 # Инициализация FastAPI приложения
 app = FastAPI()
 
 # Kafka продьюсер
 producer = KafkaProducer(bootstrap_servers=['localhost:9092'])
 
-# Очередь для отправки событий
-EVENT_TOPIC = "events-stream"
+
 
 
 @app.post("/event")
