@@ -2,6 +2,7 @@ import json
 import hashlib
 from redis.asyncio import Redis
 from pybloom_live import ScalableBloomFilter
+from pybloom_live import BloomFilter
 
 class Deduplicator:
     def __init__(self, redis: Redis, ttl_seconds: int = 7 * 24 * 60 * 60):
@@ -33,4 +34,16 @@ class Deduplicator:
         await self.redis.set(event_hash, 1, ex=self.ttl)
         self.bloom.add(event_hash)
         return False
+
+    async def reset(self):
+        print("🔁 Сброс хешей в Redis и Bloom-фильтре...")
+
+        # Очистка Redis (только если ты знаешь, что Redis используется только для дедупликации)
+        await self.redis.flushdb()
+
+        # Пересоздание Bloom-фильтра
+        self.bloom = BloomFilter(capacity=1_000_000, error_rate=0.001)
+
+        print("✅ Сброс завершён")
+
 

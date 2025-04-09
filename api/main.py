@@ -2,46 +2,55 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import json
 import os
-import httpx
-from kafka import KafkaProducer
 import uuid
-from api.models.event import Event
 from dotenv import load_dotenv
+from aiokafka import AIOKafkaProducer
+from api.models.event import Event
+
 load_dotenv()
 
-# Очередь для отправки событий
-EVENT_TOPIC = os.getenv("TOPIC")
-# Инициализация FastAPI приложения
+EVENT_TOPIC = os.getenv("TOPIC", "events")  # значение по умолчанию
+
 app = FastAPI()
-
-# Kafka продьюсер
-producer = KafkaProducer(bootstrap_servers=['localhost:9092'])
+producer: AIOKafkaProducer | None = None  # глобальный продьюсер
 
 
+# Старт приложения
+@app.on_event("startup")
+async def startup_event():
+    global producer
+    producer = AIOKafkaProducer(bootstrap_servers="localhost:9092")
+    await producer.start()
+    print("🚀 Kafka producer запущен")
 
 
+# Завершение приложения
+@app.on_event("shutdown")
+async def shutdown_event():
+    if producer:
+        await producer.stop()
+        print("🛑 Kafka producer остановлен")
+
+
+# Роут для приёма событий
 @app.post("/event")
 async def post_event(event: Event):
-    # Быстрая проверка и валидация
     try:
-        # Генерация уникального ID для события
         event_id = str(uuid.uuid4())
-
-        # Асинхронно отправляем событие в Kafka
         await send_to_kafka(event, event_id)
-
-        # Быстрый ответ
         return {"message": "Event received successfully", "event_id": event_id}
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Функция отправки события в Kafka
 async def send_to_kafka(event: Event, event_id: str):
-    # Преобразуем событие в JSON
     event_dict = event.dict()
     event_dict["event_id"] = event_id
+    payload = json.dumps(event_dict).encode("utf-8")
 
-    # Отправка события в Kafka
-    producer.send(EVENT_TOPIC, value=json.dumps(event_dict).encode('utf-8'))
-    producer.flush()
+    if not producer:
+        raise RuntimeError("Kafka producer is not initialized")
+
+    await producer.send_and_wait(EVENT_TOPIC, payload)
+    print(f"📤 Отправлено в Kafka: {event_id}")
