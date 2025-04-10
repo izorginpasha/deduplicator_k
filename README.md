@@ -68,17 +68,7 @@ graph TD
 
 ---
 
-### 🧪 Формат события (`Event`)
-```json
-{
-  "event_name": "string",
-  "userId": "string",
-  "client_id": "string",
-  "event_datetime": "2024-01-01T00:00:00Z",
-  "product_id": "string",
-  "client_id_query": "string"
-}
-```
+
 
 ---
 
