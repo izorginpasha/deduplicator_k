@@ -7,11 +7,15 @@ from dotenv import load_dotenv
 import os
 import signal
 import sys
+import ydb
+from datetime import datetime
 
 load_dotenv()
 
 TOPIC = os.getenv("TOPIC")  # ← значение по умолчанию
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP")
+YDB_ENDPOINT = os.getenv("YDB_ENDPOINT")  # Конфиг для YDB
+YDB_DATABASE = os.getenv("YDB_DATABASE")  # База данных в YDB
 
 # Redis клиент
 redis_client = redis.Redis(host='localhost', port=6379, db=0)
@@ -19,10 +23,35 @@ redis_client = redis.Redis(host='localhost', port=6379, db=0)
 # Дедупликатор
 deduplicator = Deduplicator(redis=redis_client)
 
+# YDB клиент
+ydb_client = ydb.Driver(
+    endpoint=YDB_ENDPOINT,
+    database=YDB_DATABASE,
+    credentials=ydb.auth.MetadataTokenCredentials('YOUR_YDB_METADATA_TOKEN')
+)
+ydb_client.wait()
+
+
+# YDB таблица для сохранения событий
+def get_event_table():
+    return ydb_client.table(YDB_DATABASE + "/events")
+
+
 # Обработчик событий
 async def handle_event(event: dict):
     print(f"✅ Уникальное событие: {event['event_id']}")
-    # Здесь можно сохранить в базу данных
+
+    # Запись в YDB
+    table = get_event_table()
+    insert_query = f"""
+    INSERT INTO events (event_id, event_name, user_id, event_datetime, product_id, client_id_query)
+    VALUES ('{event['event_id']}', '{event['event_name']}', '{event['userId']}', '{event['event_datetime']}', '{event['product_id']}', '{event['client_id_query']}')
+    """
+
+    # Выполнение запроса на добавление данных в YDB
+    with table.session() as session:
+        session.execute(insert_query)
+
 
 # Основной консюмер
 async def consume():
@@ -56,7 +85,9 @@ async def consume():
     finally:
         await consumer.stop()
         await redis_client.close()
+        ydb_client.stop()
         print("🧹 Очистка завершена, соединения закрыты.")
+
 
 # Обёртка для запуска
 def main():
@@ -79,6 +110,7 @@ def main():
         pass
     finally:
         loop.close()
+
 
 if __name__ == "__main__":
     main()
