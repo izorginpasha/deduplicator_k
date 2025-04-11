@@ -1,3 +1,5 @@
+version: "3.8"
+
 services:
   redis:
     image: redis:7
@@ -41,17 +43,6 @@ services:
     depends_on:
       - kafka
 
-
-  ydb-cli:
-    image: python:3.9-slim
-    volumes:
-      - ./ydb_certs:/ydb_certs
-    entrypoint: /bin/bash -c "apt-get update && apt-get install -y curl && curl -sSL https://storage.yandexcloud.net/ydb-releases/ydb-linux-amd64 -o /usr/local/bin/ydb && chmod +x /usr/local/bin/ydb && ydb --help"
-    stdin_open: true
-    tty: true
-
-
-
   api:
     build:
       context: .
@@ -69,4 +60,5 @@ services:
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 volumes:
-  ydb-data:  # указание тома для YDB
+  ydb_data:  # том для данных YDB
+  ydb_certs:  # том для сертификатов
