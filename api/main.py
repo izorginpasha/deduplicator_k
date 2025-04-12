@@ -6,7 +6,7 @@ import uuid
 from dotenv import load_dotenv
 from aiokafka import AIOKafkaProducer
 from api.models.event import Event
-
+from contextlib import asynccontextmanager
 load_dotenv()
 
 EVENT_TOPIC = os.getenv("TOPIC", "events")  # значение по умолчанию
@@ -15,21 +15,20 @@ app = FastAPI()
 producer: AIOKafkaProducer | None = None  # глобальный продьюсер
 
 
-# Старт приложения
-@app.on_event("startup")
-async def startup_event():
-    global producer
+# Создание асинхронного контекстного менеджера для обработки старта и завершения работы приложения
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Этот код выполняется при старте приложения
     producer = AIOKafkaProducer(bootstrap_servers="localhost:9092")
     await producer.start()
     print("🚀 Kafka producer запущен")
+    yield producer  # передаем producer в FastAPI
+    # Этот код выполняется при завершении работы приложения
+    await producer.stop()
+    print("🛑 Kafka producer остановлен")
 
 
-# Завершение приложения
-@app.on_event("shutdown")
-async def shutdown_event():
-    if producer:
-        await producer.stop()
-        print("🛑 Kafka producer остановлен")
+app = FastAPI(lifespan=lifespan)
 
 
 # Роут для приёма событий
