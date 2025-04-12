@@ -14,8 +14,7 @@ load_dotenv()
 
 TOPIC = os.getenv("TOPIC")  # ← значение по умолчанию
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP")
-YDB_ENDPOINT = os.getenv("YDB_ENDPOINT")  # Конфиг для YDB
-YDB_DATABASE = os.getenv("YDB_DATABASE")  # База данных в YDB
+с
 
 # Redis клиент
 redis_client = redis.Redis(host='localhost', port=6379, db=0)
