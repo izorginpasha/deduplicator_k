@@ -3,32 +3,38 @@ from pydantic import BaseModel
 import json
 import os
 import uuid
+from kafka import KafkaProducer
 from dotenv import load_dotenv
 from aiokafka import AIOKafkaProducer
 from api.models.event import Event
 from contextlib import asynccontextmanager
 load_dotenv()
 
-EVENT_TOPIC = os.getenv("TOPIC", "events")  # значение по умолчанию
-
+EVENT_TOPIC = os.getenv("TOPIC")  # значение по умолчанию
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP")
 app = FastAPI()
-producer: AIOKafkaProducer | None = None  # глобальный продьюсер
+# Kafka продьюсер
+producer = KafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP)
 
 
-# Создание асинхронного контекстного менеджера для обработки старта и завершения работы приложения
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Этот код выполняется при старте приложения
-    producer = AIOKafkaProducer(bootstrap_servers="localhost:9092")
+# Старт приложения
+@app.on_event("startup")
+async def startup_event():
+    global producer
+    producer = AIOKafkaProducer(bootstrap_servers="kafka:9092")  # Используйте правильный адрес
     await producer.start()
     print("🚀 Kafka producer запущен")
-    yield producer  # передаем producer в FastAPI
-    # Этот код выполняется при завершении работы приложения
-    await producer.stop()
-    print("🛑 Kafka producer остановлен")
 
 
-app = FastAPI(lifespan=lifespan)
+# Завершение приложения
+@app.on_event("shutdown")
+async def shutdown_event():
+    if producer:
+        await producer.stop()
+        print("🛑 Kafka producer остановлен")
+
+
+
 
 
 # Роут для приёма событий

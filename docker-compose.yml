@@ -1,11 +1,14 @@
-
 services:
   redis:
+    container_name: redis
     image: redis:7
     ports:
       - "6379:6379"
+    networks:
+      - app-network
 
   kafka:
+    container_name: kafka
     image: bitnami/kafka:latest
     ports:
       - "9092:9092"
@@ -22,17 +25,28 @@ services:
       - ALLOW_PLAINTEXT_LISTENER=yes
     depends_on:
       - redis
+    networks:
+      - app-network
 
   api:
+    container_name: api
     build:
       context: .
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
+    volumes:
+      - .:/app  # Монтируем директорию с кодом на хосте в контейнер
     environment:
-      - TOPIC=events
-      - KAFKA_BOOTSTRAP=kafka:9092
+      - TOPIC=${TOPIC}
+      - KAFKA_BOOTSTRAP=${KAFKA_BOOTSTRAP}
     depends_on:
       - kafka
       - redis
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - app-network
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload  # Запуск с параметром --reload для автоматического перезапуска при изменениях
+
+networks:
+  app-network:
+    driver: bridge

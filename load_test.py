@@ -14,7 +14,7 @@ REDIS_PORT = 6379
 QUEUE_KEY = 'events:queue'
 EVENT_FILE = 'results-1743680955719.json'
 API_URL = "http://localhost:8000/event"
-DURATION = 6  # общее время выполнения теста (в секундах)
+DURATION = 30  # общее время выполнения теста (в секундах)
 CONCURRENCY = 10
 PROMETHEUS_PORT = 8001
 
