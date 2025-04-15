@@ -1,3 +1,4 @@
+
 services:
   redis:
     container_name: redis
@@ -46,6 +47,18 @@ services:
     networks:
       - app-network
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload  # Запуск с параметром --reload для автоматического перезапуска при изменениях
+
+  consumer:
+    container_name: consumer
+    build:
+      context: .  # Путь к директории с кодом consumer
+      dockerfile: Dockerfile  # Убедись, что у тебя есть Dockerfile для consumer
+    command: python consumer/consumer.py  # Команда для запуска consumer
+    depends_on:
+      - kafka
+      - redis
+    networks:
+      - app-network
 
 networks:
   app-network:

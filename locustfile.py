@@ -8,7 +8,7 @@ with open("results-1743680955719.json", "r", encoding="utf-8") as f:
     events_data = json.load(f)
 
 class EventUser(HttpUser):
-    wait_time = between(0.01, 0.1)  # имитация пользователей (задержка между запросами)
+    wait_time = between(0, 0)  # имитация пользователей (задержка между запросами)
 
     @task
     def send_random_event(self):

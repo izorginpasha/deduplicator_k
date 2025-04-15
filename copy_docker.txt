@@ -1,0 +1,146 @@
+
+services:
+  kafka1:
+    image: bitnami/kafka:latest
+    hostname: kafka1
+    container_name: kafka1
+    ports:
+      - "9092:9092"
+    environment:
+      - KAFKA_KRAFT_MODE=true
+      - KAFKA_CFG_NODE_ID=1
+      - KAFKA_CFG_PROCESS_ROLES=broker,controller
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://kafka1:9092,CONTROLLER://kafka1:9093
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka1:9092
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_LOG_DIRS=/bitnami/kafka/data
+      - ALLOW_PLAINTEXT_LISTENER=yes
+    volumes:
+      - kafka1_data:/bitnami/kafka
+    networks:
+      - app-network
+
+  kafka2:
+    image: bitnami/kafka:latest
+    hostname: kafka2
+    container_name: kafka2
+    ports:
+      - "9094:9092"
+    environment:
+      - KAFKA_KRAFT_MODE=true
+      - KAFKA_CFG_NODE_ID=2
+      - KAFKA_CFG_PROCESS_ROLES=broker,controller
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://kafka2:9092,CONTROLLER://kafka2:9093
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka2:9092
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_LOG_DIRS=/bitnami/kafka/data
+      - ALLOW_PLAINTEXT_LISTENER=yes
+    volumes:
+      - kafka2_data:/bitnami/kafka
+    networks:
+      - app-network
+
+  kafka3:
+    image: bitnami/kafka:latest
+    hostname: kafka3
+    container_name: kafka3
+    ports:
+      - "9096:9092"
+    environment:
+      - KAFKA_KRAFT_MODE=true
+      - KAFKA_CFG_NODE_ID=3
+      - KAFKA_CFG_PROCESS_ROLES=broker,controller
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://kafka3:9092,CONTROLLER://kafka3:9093
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka3:9092
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_LOG_DIRS=/bitnami/kafka/data
+      - ALLOW_PLAINTEXT_LISTENER=yes
+    volumes:
+      - kafka3_data:/bitnami/kafka
+    networks:
+      - app-network
+
+  kafka-init:
+    image: bitnami/kafka:latest
+    container_name: kafka-init
+    depends_on:
+      - kafka1
+      - kafka2
+      - kafka3
+    entrypoint: [ "/bin/sh", "-c" ]
+    command: >
+      echo 'Waiting for Kafka to start...';
+      while ! nc -z kafka1 9092; do sleep 1; done;
+      while ! nc -z kafka2 9092; do sleep 1; done;
+      while ! nc -z kafka3 9092; do sleep 1; done;
+      echo 'Kafka is up. Creating topic...';
+      kafka-topics.sh --create --if-not-exists --bootstrap-server kafka1:9092,kafka2:9092,kafka3:9092 \
+        --replication-factor 3 --partitions 3 --topic $${TOPIC} &&
+      kafka-configs.sh --bootstrap-server kafka1:9092 --entity-type topics --entity-name $${TOPIC} \
+        --alter --add-config min.insync.replicas=2 &&
+      echo 'Topics list:' &&
+      kafka-topics.sh --list --bootstrap-server kafka1:9092
+    environment:
+      - TOPIC=${TOPIC}
+    networks:
+      - app-network
+
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - app-network
+
+  api:
+    build: .
+    container_name: api
+    ports:
+      - "8000:8000"
+    environment:
+      - TOPIC=${TOPIC}
+      - KAFKA_BOOTSTRAP=kafka-1:9092,kafka-2:9092,kafka-3:9092
+      - REDIS_HOST=redis
+    depends_on:
+      - kafka-init
+      - redis
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  consumer:
+    build: .
+    container_name: consumer
+    environment:
+      - TOPIC=${TOPIC}
+      - KAFKA_BOOTSTRAP=kafka-1:9092,kafka-2:9092,kafka-3:9092
+      - REDIS_HOST=redis
+    depends_on:
+      - kafka-init
+      - redis
+    networks:
+      - app-network
+    restart: unless-stopped
+
+volumes:
+  kafka1_data:
+  kafka2_data:
+  kafka3_data:
+  redis_data:
+
+networks:
+  app-network:
+    driver: bridge

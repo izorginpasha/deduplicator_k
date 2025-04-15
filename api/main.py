@@ -14,14 +14,14 @@ EVENT_TOPIC = os.getenv("TOPIC")  # значение по умолчанию
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP")
 app = FastAPI()
 # Kafka продьюсер
-producer = KafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP)
+# producer = KafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP)
 
 
 # Старт приложения
 @app.on_event("startup")
 async def startup_event():
     global producer
-    producer = AIOKafkaProducer(bootstrap_servers="kafka:9092")  # Используйте правильный адрес
+    producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP)  # Используйте правильный адрес
     await producer.start()
     print("🚀 Kafka producer запущен")
 
