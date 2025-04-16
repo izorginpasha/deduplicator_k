@@ -1,49 +1,51 @@
 import json
 import hashlib
+from datetime import datetime
+from typing import Dict, Any
 from redis.asyncio import Redis
 from pybloom_live import ScalableBloomFilter
-from pybloom_live import BloomFilter
+from db.clickhouse_manager import ClickHouseManager
 
 class Deduplicator:
-    def __init__(self, redis: Redis, ttl_seconds: int = 7 * 24 * 60 * 60):
+    def __init__(self, redis: Redis, clickhouse: ClickHouseManager, ttl_seconds: int = 2 * 60 * 60):
         self.redis = redis
-        self.ttl = ttl_seconds
+        self.ch = clickhouse
+        self.redis_ttl = ttl_seconds
         self.bloom = ScalableBloomFilter(mode=ScalableBloomFilter.SMALL_SET_GROWTH)
 
     def _serialize_event(self, event: dict) -> str:
-        keys = ["event_name", "userId", "client_id", "event_datetime", "product_id", "client_id_query"]
-        filtered = {k: event.get(k) for k in keys}
-        return json.dumps(filtered, sort_keys=True)
+        # Преобразуем все значения datetime в строки ISO 8601
+        def convert_datetime(obj):
+            if isinstance(obj, datetime):
+                return obj.isoformat()
+            return obj
+
+        # Применяем преобразование ко всем значениям в event
+        event_processed = {k: convert_datetime(v) for k, v in event.items()}
+        return json.dumps(event_processed, sort_keys=True)
 
     def _hash_event(self, event: dict) -> str:
         serialized = self._serialize_event(event)
-        return hashlib.sha256(serialized.encode()).hexdigest()
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
     async def is_duplicate(self, event: dict) -> bool:
         event_hash = self._hash_event(event)
 
-        # Быстрая проверка в Redis
+        # Проверяем наличие хеша в Redis
         if await self.redis.exists(event_hash):
             return True
 
-        # Точная проверка в Bloom
+        # Проверяем наличие в Bloom-фильтре (синхронный вызов)
         if event_hash in self.bloom:
             return True
 
-        # Уникальное — сохраняем
-        await self.redis.set(event_hash, 1, ex=self.ttl)
-        self.bloom.add(event_hash)
+        # Если в базе данных уже зарегистрирован — дубликат
+        if self.ch.is_duplicate(event_hash):
+            await self.redis.set(event_hash, 1, ex=self.redis_ttl)
+            return True
+
+        # Регистрируем хеш в Redis и Bloom-фильтре
+        await self.redis.set(event_hash, 1, ex=self.redis_ttl)
+        self.bloom.add(event_hash)  # нет необходимости в await
+        self.ch.insert_event(event_hash)
         return False
-
-    async def reset(self):
-        print("🔁 Сброс хешей в Redis и Bloom-фильтре...")
-
-        # Очистка Redis (только если ты знаешь, что Redis используется только для дедупликации)
-        await self.redis.flushdb()
-
-        # Пересоздание Bloom-фильтра
-        self.bloom = BloomFilter(capacity=1_000_000, error_rate=0.001)
-
-        print("✅ Сброс завершён")
-
-

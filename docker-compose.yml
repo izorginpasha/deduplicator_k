@@ -1,4 +1,3 @@
-
 services:
   redis:
     container_name: redis
@@ -30,6 +29,25 @@ services:
     networks:
       - app-network
 
+  clickhouse:
+    container_name: clickhouse
+    image: clickhouse/clickhouse-server:latest
+    ports:
+      - "8123:8123"   # HTTP-интерфейс
+      - "9000:9000"   # TCP-интерфейс для клиентов
+    environment:
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=my_password
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse-init-scripts:/docker-entrypoint-initdb.d  # Добавляем путь к скриптам
+    networks:
+      - app-network
+
   api:
     container_name: api
     build:
@@ -38,29 +56,38 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - .:/app  # Монтируем директорию с кодом на хосте в контейнер
+      - .:/app
     environment:
       - TOPIC=${TOPIC}
       - KAFKA_BOOTSTRAP=${KAFKA_BOOTSTRAP}
     depends_on:
       - kafka
       - redis
+      - clickhouse
     networks:
       - app-network
-    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload  # Запуск с параметром --reload для автоматического перезапуска при изменениях
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 
   consumer:
     container_name: consumer
     build:
-      context: .  # Путь к директории с кодом consumer
-      dockerfile: Dockerfile  # Убедись, что у тебя есть Dockerfile для consumer
-    command: python consumer/consumer.py  # Команда для запуска consumer
+      context: .
+      dockerfile: Dockerfile
+    command: python consumer/consumer.py
+    environment:
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=my_password
     depends_on:
       - kafka
       - redis
+      - clickhouse
     networks:
       - app-network
 
 networks:
   app-network:
     driver: bridge
+
+volumes:
+  clickhouse_data:

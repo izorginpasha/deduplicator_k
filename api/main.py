@@ -1,21 +1,18 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 import json
 import os
 import uuid
-from kafka import KafkaProducer
 from dotenv import load_dotenv
 from aiokafka import AIOKafkaProducer
-from api.models.event import Event
-from contextlib import asynccontextmanager
+
 load_dotenv()
 
 EVENT_TOPIC = os.getenv("TOPIC")  # значение по умолчанию
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP")
 app = FastAPI()
+
 # Kafka продьюсер
 # producer = KafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP)
-
 
 # Старт приложения
 @app.on_event("startup")
@@ -34,12 +31,9 @@ async def shutdown_event():
         print("🛑 Kafka producer остановлен")
 
 
-
-
-
 # Роут для приёма событий
 @app.post("/event")
-async def post_event(event: Event):
+async def post_event(event: dict):  # Принимаем событие как обычный словарь
     try:
         event_id = str(uuid.uuid4())
         await send_to_kafka(event, event_id)
@@ -49,10 +43,14 @@ async def post_event(event: Event):
 
 
 # Функция отправки события в Kafka
-async def send_to_kafka(event: Event, event_id: str):
-    event_dict = event.dict()
-    event_dict["event_id"] = event_id
-    payload = json.dumps(event_dict).encode("utf-8")
+async def send_to_kafka(event: dict, event_id: str):
+    event["event_id"] = event_id  # добавляем event_id прямо в словарь
+
+    try:
+        payload = json.dumps(event).encode("utf-8")
+    except TypeError as e:
+        # Если какой-то тип данных не сериализуется в JSON
+        raise ValueError(f"Ошибка сериализации события в JSON: {e}")
 
     if not producer:
         raise RuntimeError("Kafka producer is not initialized")
