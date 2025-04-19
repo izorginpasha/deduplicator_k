@@ -46,6 +46,6 @@ class Deduplicator:
 
         # Регистрируем хеш в Redis и Bloom-фильтре
         await self.redis.set(event_hash, 1, ex=self.redis_ttl)
-        self.bloom.add(event_hash)  # нет необходимости в await
+        self.bloom.add(event_hash)
         self.ch.insert_event(event_hash)
         return False

@@ -73,7 +73,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    working_dir: /app
     command: python consumer/consumer.py
+    volumes:
+      - .:/app
     environment:
       - CLICKHOUSE_HOST=clickhouse
       - CLICKHOUSE_USER=default

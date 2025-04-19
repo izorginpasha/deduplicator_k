@@ -19,7 +19,7 @@ TOPIC = os.getenv("TOPIC", "events")
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "clickhouse")
-NUM_WORKERS = int(os.getenv("NUM_WORKERS", 20))
+NUM_WORKERS = 2  #int(os.getenv("NUM_WORKERS"))
 GROUP_ID = os.getenv("GROUP_ID", "events-group")
 CONSUMER_NAME = os.getenv("CONSUMER_NAME", "consumer")
 CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "clickhouse")
@@ -46,22 +46,29 @@ deduplicator = Deduplicator(redis=redis_client, clickhouse=ch_manager)
 
 event_queue = asyncio.Queue()
 
+
 # ─── Обработка уникального события ─────────────────────────────────────────────
 async def handle_event(event: dict):
     logger.info(f"✅ Уникальное событие: {event.get('event_id')}")
     # Здесь может быть логика дальнейшей обработки
     # Например, отправка в другую систему или запись в Postgres
 
+
 # ─── Воркер ─────────────────────────────────────────────────────────────────────
 async def worker(worker_id: int):
     while True:
         event = await event_queue.get()
+        if event is None:
+            logger.info(f"👋 Воркер #{worker_id} завершает работу")
+            event_queue.task_done()
+            break
         try:
             await handle_event(event)
         except Exception as e:
             logger.error(f"⚠️ Ошибка в воркере #{worker_id}: {e}")
         finally:
             event_queue.task_done()
+
 
 # ─── Kafka Consumer ────────────────────────────────────────────────────────────
 async def consume():
@@ -78,17 +85,16 @@ async def consume():
     logger.info("🔄 Kafka consumer запущен...")
 
     try:
-        async for msg in consumer:
-            try:
-                event = json.loads(msg.value.decode())
+        while True:
+            msg = await consumer.getone() # получаем сообщение из очереди
+            event = json.loads(msg.value.decode())# обрабатываем в словарь
 
-
-                if not await deduplicator.is_duplicate(event):
-                    await event_queue.put(event)
-                else:
-                    logger.info(f"⛔ Дубликат: {event.get('event_id')}")
-            except Exception as e:
-                logger.warning(f"⚠️ Ошибка при обработке сообщения: {e}")
+            if not await deduplicator.is_duplicate(event):# отправляем в дедубликатор
+                await event_queue.put(event)
+            else:
+                logger.info(f"⛔ Дубликат: {event.get('event_id')}")
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка при обработке сообщения: {e}")
     except asyncio.CancelledError:
         logger.info("🛑 Получен сигнал остановки")
     finally:
@@ -96,34 +102,48 @@ async def consume():
         await redis_client.close()
         logger.info("🧹 Kafka consumer и Redis закрыты")
 
+
+
 # ─── Точка входа ───────────────────────────────────────────────────────────────
-def main():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+async def async_main():
+    consumer_task = asyncio.create_task(consume())
+    worker_tasks = [asyncio.create_task(worker(i)) for i in range(NUM_WORKERS)]
 
-    consumer_task = loop.create_task(consume())
-    worker_tasks = [loop.create_task(worker(i)) for i in range(NUM_WORKERS)]
+    loop = asyncio.get_running_loop()
 
-    def shutdown(*_):
+    stop_event = asyncio.Event()
+
+    def shutdown():
         logger.info("🚪 Завершение работы...")
-        consumer_task.cancel()
-        for task in worker_tasks:
-            task.cancel()
+        stop_event.set()
 
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+    loop.add_signal_handler(signal.SIGINT, shutdown)
+    loop.add_signal_handler(signal.SIGTERM, shutdown)
 
     try:
-        loop.run_until_complete(consumer_task)
-    except asyncio.CancelledError:
-        pass
+        await stop_event.wait()  # Ждём сигнала завершения
     finally:
-        loop.run_until_complete(event_queue.join())
-        for task in worker_tasks:
-            task.cancel()
-        loop.run_until_complete(asyncio.gather(*worker_tasks, return_exceptions=True))
-        loop.close()
+        logger.info("⛔ Остановка consumer и завершение воркеров...")
+        consumer_task.cancel()
+        try:
+            await consumer_task
+        except asyncio.CancelledError:
+            pass
+
+        # Завершаем очередь: отправим None каждому воркеру
+        for _ in range(NUM_WORKERS):
+            await event_queue.put(None)
+
+        # Ждём завершения очереди
+        await event_queue.join()
+
+        # Завершаем воркеры
+        await asyncio.gather(*worker_tasks, return_exceptions=True)
+
         logger.info("🏁 Все задачи завершены")
+
+def main():
+    asyncio.run(async_main())
 
 if __name__ == "__main__":
     main()

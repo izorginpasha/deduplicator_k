@@ -12,7 +12,7 @@ KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP")
 app = FastAPI()
 
 # Kafka продьюсер
-# producer = KafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP)
+producer: AIOKafkaProducer | None = None
 
 # Старт приложения
 @app.on_event("startup")
