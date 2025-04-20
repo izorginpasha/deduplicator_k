@@ -19,7 +19,7 @@ TOPIC = os.getenv("TOPIC", "events")
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "clickhouse")
-NUM_WORKERS = 2  #int(os.getenv("NUM_WORKERS"))
+NUM_WORKERS = 5  #int(os.getenv("NUM_WORKERS"))
 GROUP_ID = os.getenv("GROUP_ID", "events-group")
 CONSUMER_NAME = os.getenv("CONSUMER_NAME", "consumer")
 CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "clickhouse")
@@ -48,31 +48,33 @@ event_queue = asyncio.Queue()
 
 
 # ─── Обработка уникального события ─────────────────────────────────────────────
-async def handle_event(event: dict):
-    logger.info(f"✅ Уникальное событие: {event.get('event_id')}")
-    # Здесь может быть логика дальнейшей обработки
-    # Например, отправка в другую систему или запись в Postgres
-
+# async def handle_event(event: dict):
+#     logger.info(f"✅ Уникальное событие: {event.get('event_id')}")
+#
+#     # Здесь может быть логика дальнейшей обработки
+#     # Например, отправка в другую систему или запись в Postgres
+#
 
 # ─── Воркер ─────────────────────────────────────────────────────────────────────
-async def worker(worker_id: int):
-    while True:
-        event = await event_queue.get()
-        if event is None:
-            logger.info(f"👋 Воркер #{worker_id} завершает работу")
-            event_queue.task_done()
-            break
-        try:
-            await handle_event(event)
-        except Exception as e:
-            logger.error(f"⚠️ Ошибка в воркере #{worker_id}: {e}")
-        finally:
-            event_queue.task_done()
+# async def worker(worker_id: int):
+#     while True:
+#         event = await event_queue.get()
+#         if event is None:
+#             logger.info(f"👋 Воркер #{worker_id} завершает работу")
+#             event_queue.task_done()
+#             break
+#         try:
+#             await handle_event(event)
+#         except Exception as e:
+#             logger.error(f"⚠️ Ошибка в воркере #{worker_id}: {e}")
+#         finally:
+#             event_queue.task_done()
 
 
 # ─── Kafka Consumer ────────────────────────────────────────────────────────────
 async def consume():
-    ch_manager.create_events_table()  # Убедимся, что таблица создана
+    # создание таблици если еще нет
+    await ch_manager.create_events_table()
 
     consumer = AIOKafkaConsumer(
         TOPIC,
@@ -99,7 +101,7 @@ async def consume():
         logger.info("🛑 Получен сигнал остановки")
     finally:
         await consumer.stop()
-        await redis_client.close()
+        await redis_client.aclose()
         logger.info("🧹 Kafka consumer и Redis закрыты")
 
 
@@ -107,7 +109,7 @@ async def consume():
 # ─── Точка входа ───────────────────────────────────────────────────────────────
 async def async_main():
     consumer_task = asyncio.create_task(consume())
-    worker_tasks = [asyncio.create_task(worker(i)) for i in range(NUM_WORKERS)]
+    # worker_tasks = [asyncio.create_task(worker(i)) for i in range(NUM_WORKERS)]
 
     loop = asyncio.get_running_loop()
 
@@ -137,8 +139,8 @@ async def async_main():
         # Ждём завершения очереди
         await event_queue.join()
 
-        # Завершаем воркеры
-        await asyncio.gather(*worker_tasks, return_exceptions=True)
+        # # Завершаем воркеры
+        # await asyncio.gather(*worker_tasks, return_exceptions=True)
 
         logger.info("🏁 Все задачи завершены")
 
