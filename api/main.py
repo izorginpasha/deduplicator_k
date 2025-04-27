@@ -35,16 +35,14 @@ async def shutdown_event():
 @app.post("/event")
 async def post_event(event: dict):  # Принимаем событие как обычный словарь
     try:
-        event_id = str(uuid.uuid4())
-        await send_to_kafka(event, event_id)
-        return {"message": "Event received successfully", "event_id": event_id}
+        await send_to_kafka(event)
+        return {"message": "Event received successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # Функция отправки события в Kafka
-async def send_to_kafka(event: dict, event_id: str):
-    event["event_id"] = event_id  # добавляем event_id прямо в словарь
+async def send_to_kafka(event: dict):
 
     try:
         payload = json.dumps(event).encode("utf-8")
@@ -56,4 +54,4 @@ async def send_to_kafka(event: dict, event_id: str):
         raise RuntimeError("Kafka producer is not initialized")
 
     await producer.send_and_wait(EVENT_TOPIC, payload)
-    print(f"📤 Отправлено в Kafka: {event_id}")
+    print(f"📤 Отправлено в Kafka: ")
