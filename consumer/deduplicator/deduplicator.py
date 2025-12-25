@@ -2,19 +2,14 @@ import json
 import hashlib
 import time
 from datetime import datetime
-from typing import Dict, Any
 from redis.asyncio import Redis
 from pybloom_live import ScalableBloomFilter
-from db.clickhouse_manager import ClickHouseManager
+from consumer.db.clickhouse_manager import ClickHouseManager
 
 
 class Deduplicator:
-    def __init__(self, redis: Redis, clickhouse: ClickHouseManager, ttl_seconds: int = 2 * 60 * 60):
-        self.redis = redis
+    def __init__(self, clickhouse: ClickHouseManager):
         self.ch = clickhouse
-        self.redis_ttl = ttl_seconds
-        self.bloom = ScalableBloomFilter(mode=ScalableBloomFilter.SMALL_SET_GROWTH)
-        self.last_cleanup_time = time.time()
 
     def _serialize_event(self, event: dict) -> str:
         # Преобразуем все значения datetime в строки ISO 8601
@@ -33,19 +28,6 @@ class Deduplicator:
 
     async def is_duplicate(self, event: dict) -> bool:
         event_hash = self._hash_event(event)
-
-        # Очистка Bloom-фильтра каждые N минут (например, 60 минут)
-        if time.time() - self.last_cleanup_time > 3600:  # 1 час
-            self._cleanup_bloom_filter()
-
-        # Проверяем наличие хеша в Redis
-        if await self.redis.exists(event_hash):
-            return True
-
-        # Проверяем наличие в Bloom-фильтре (синхронный вызов)
-        if event_hash in self.bloom:
-            return True
-
         # Если в базе данных уже зарегистрирован — дубликат
         # Асинхронная проверка
         is_duplicate_in_ch = await self.ch.is_duplicate(event_hash)

@@ -1,9 +1,5 @@
 FROM python:3.12-slim
 
-# Обновляем репозитории и устанавливаем необходимые пакеты
-RUN apt-get update --allow-releaseinfo-change \
-    && apt-get install -y ca-certificates curl gnupg build-essential \
-    && apt-get clean
 
 # Копируем requirements.txt
 COPY requirements.txt .

@@ -9,8 +9,8 @@ import redis.asyncio as redis
 from clickhouse_driver import Client
 from dotenv import load_dotenv
 
-from deduplicator.deduplicator import Deduplicator
-from db.clickhouse_manager import ClickHouseManager
+from consumer.deduplicator.deduplicator import Deduplicator
+from consumer.db.clickhouse_manager import ClickHouseManager
 
 # ─── Загрузка переменных окружения ─────────────────────────────────────────────
 load_dotenv()
