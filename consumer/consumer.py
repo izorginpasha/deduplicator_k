@@ -5,34 +5,33 @@ import signal
 import logging
 
 from aiokafka import AIOKafkaConsumer
-import redis.asyncio as redis
 from clickhouse_driver import Client
 from dotenv import load_dotenv
 
 from consumer.deduplicator.deduplicator import Deduplicator
-from consumer.db.clickhouse_manager import ClickHouseManager
-
+from consumer.db.clickhouse.clickhouse_manager import ClickHouseManager
+from consumer.db.rocks.rocks_manager import RocksDedupStore
 # ─── Загрузка переменных окружения ─────────────────────────────────────────────
 load_dotenv()
 
-TOPIC = os.getenv("TOPIC", "events")
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
-REDIS_HOST = os.getenv("REDIS_HOST", "redis")
-CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "clickhouse")
-GROUP_ID = os.getenv("GROUP_ID", "events-group")
-CONSUMER_NAME = os.getenv("CONSUMER_NAME", "consumer")
-CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "clickhouse")
-CLICKHOUSE_PORT = int(os.getenv("CLICKHOUSE_PORT", 9000))
-CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "default")
-CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "my_password")
-CLICKHOUSE_DB = os.getenv("CLICKHOUSE_DB", "default")
-
+TOPIC = os.getenv("TOPIC")
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP")
+REDIS_HOST = os.getenv("REDIS_HOST")
+CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST")
+GROUP_ID = os.getenv("GROUP_ID")
+CONSUMER_NAME = os.getenv("CONSUMER_NAME")
+CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST")
+CLICKHOUSE_PORT = int(os.getenv("CLICKHOUSE_PORT"))
+CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER")
+CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD")
+CLICKHOUSE_DB = os.getenv("CLICKHOUSE_DB")
+PATH_ROCKS = os.getenv("PATH_ROCKS")
 # ─── Настройка логирования ─────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format=f"[{CONSUMER_NAME}] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ─── Redis и ClickHouse ────────────────────────────────────────────────────────
-redis_client = redis.Redis(host=REDIS_HOST, port=6379, db=1)
+# ───  ClickHouse ────────────────────────────────────────────────────────
+
 clickhouse_client = Client(
     host=CLICKHOUSE_HOST,
     port=CLICKHOUSE_PORT,
@@ -40,47 +39,131 @@ clickhouse_client = Client(
     password=CLICKHOUSE_PASSWORD,
     database=CLICKHOUSE_DB
 )
-ch_manager = ClickHouseManager(clickhouse_client)
-deduplicator = Deduplicator(redis=redis_client, clickhouse=ch_manager)
+rocks_store = RocksDedupStore(
+    path=PATH_ROCKS,
+    window_seconds=WINDOW_SECONDS,
+)
 
-event_queue = asyncio.Queue()
+ch_manager = ClickHouseManager(clickhouse_client)
+
+deduplicator = Deduplicator( rocks_store)
+
+event_queue = asyncio.Queue(maxsize=2000)
 
 
 
 # ─── Kafka Consumer ────────────────────────────────────────────────────────────
 async def consume():
-    # создание таблици если еще нет
-    await ch_manager.create_events_table()
 
     consumer = AIOKafkaConsumer(
         TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP,
         group_id=GROUP_ID,
-        auto_offset_reset="earliest",
-        enable_auto_commit=True,
+        auto_offset_reset="latest",
+        enable_auto_commit=False,
     )
     await consumer.start()
-    logger.info("🔄 Kafka consumer запущен...")
+    logger.info(" Kafka consumer запущен...")
 
     try:
         while True:
-            msg = await consumer.getone() # получаем сообщение из очереди
-            event = json.loads(msg.value.decode())# обрабатываем в словарь
-
-            if not await deduplicator.is_duplicate(event):# отправляем в дедубликатор
-                await event_queue.put(event)
+            # получаем сообщение из очереди
+            msg = await consumer.getone()
+            # обрабатываем в словарь
+            event = json.loads(msg.value.decode())
+            # отправляем в дедубликатор
+            if not await deduplicator.is_duplicate(event):
+                # уникально в очередь на запись в clickhouse
+                await event_queue.put((msg, event))
             else:
-                logger.info(f"⛔ Дубликат: {event.get('event_id')}")
+                # Дубликаты коментим, логируем и отбрасываем
+                await consumer.commit()
+                logger.info(f" Дубликат: {event.get('event_id')}")
     except Exception as e:
-        logger.warning(f"⚠️ Ошибка при обработке сообщения: {e}")
+        # Любая ошибка при обработке сообщения
+        logger.warning(f" Ошибка при обработке сообщения: {e}")
     except asyncio.CancelledError:
-        logger.info("🛑 Получен сигнал остановки")
+        # Корректная остановка по сигналу (SIGTERM / shutdown)
+        logger.info(" Получен сигнал остановки")
     finally:
+        # Корректно закрываем Kafka consumer
         await consumer.stop()
-        await redis_client.aclose()
-        logger.info("🧹 Kafka consumer и Redis закрыты")
+        logger.info("Kafka consumer закрыт")
+
+# ─── writer ───────────────────────────────────────────────────────────────
 
 
+async def writer(batch_size=500, flush_interval=0.5):
+    # Буфер для накопления событий перед записью в ClickHouse
+    batch = []
+    msgs = []  # сообщения для расчёта offsets
+
+    # Время последней записи (flush)
+    # Используем monotonic(), чтобы не зависеть от изменения системного времени
+    last_flush = time.monotonic()
+
+    while True:
+        # Сколько ещё можно ждать новое событие,
+        # прежде чем нужно сделать принудительный flush по времени
+        timeout = flush_interval - (time.monotonic() - last_flush)
+
+        try:
+            # Пытаемся получить ОДНО событие из очереди,
+            # но не ждём дольше, чем timeout секунд
+            msg, event = await asyncio.wait_for(
+                event_queue.get(),
+                timeout=max(0, timeout)  # защита от отрицательного таймаута
+            )
+
+            # Добавляем событие в текущий batch
+            batch.append(event)
+            msgs.append(msg)
+
+            # Сообщаем очереди, что элемент успешно обработан
+            event_queue.task_done()
+
+        except asyncio.TimeoutError:
+            # Таймаут — это НЕ ошибка.
+            # Он означает, что за отведённое время
+            # новые события не пришли.
+            pass
+
+        # Условие записи batch в ClickHouse:
+        # 1) накопили batch_size событий
+        # ИЛИ
+        # 2) прошло flush_interval секунд с последней записи
+        if batch and (
+            len(batch) >= batch_size
+            or (time.monotonic() - last_flush) >= flush_interval
+        ):
+            try:
+                # 1) Пишем батч в ClickHouse
+                await ch_manager.insert_batch(batch)
+
+                # 2) Готовим offsets только для записанных сообщений
+                offsets = {}
+                for m in msgs:
+                    tp = TopicPartition(m.topic, m.partition)
+                    next_offset = m.offset + 1
+
+                    prev = offsets.get(tp)
+                    if prev is None or next_offset > prev.offset:
+                        offsets[tp] = OffsetAndMetadata(next_offset, "")
+
+                # 3) Коммитим offsets ПОСЛЕ успешной вставки
+                await consumer.commit(offsets=offsets)
+
+                # 4) Очищаем buffers только после успеха
+                batch.clear()
+                msgs.clear()
+                last_flush = time.monotonic()
+
+            except Exception as e:
+                # Не коммитим! Пусть Kafka переотдаст.
+                # batch и msgs оставляем, чтобы попробовать вставить снова.
+                logger.exception(f"ClickHouse insert/commit failed (no commit): {e}")
+                # можно добавить backoff:
+                await asyncio.sleep(0.2)
 
 # ─── Точка входа ───────────────────────────────────────────────────────────────
 async def async_main():
@@ -101,7 +184,7 @@ async def async_main():
     try:
         await stop_event.wait()  # Ждём сигнала завершения
     finally:
-        logger.info("⛔ Остановка consumer и завершение воркеров...")
+        logger.info(" Остановка consumer и завершение воркеров...")
         consumer_task.cancel()
         try:
             await consumer_task

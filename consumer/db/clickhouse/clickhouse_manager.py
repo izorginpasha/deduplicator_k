@@ -10,31 +10,11 @@ class ClickHouseManager:
     def __init__(self, client: Client):
         self.client = client
 
-    async def create_events_table(self) -> None:
-        create_table_query = """
-            CREATE TABLE IF NOT EXISTS events (
-                event_hash String,
-                event_data String,
-                created_at DateTime
-            ) ENGINE = MergeTree()
-            ORDER BY event_hash
-            TTL created_at + INTERVAL 7 DAY
-            SETTINGS ttl_only_drop_parts = 1;
-        """
-        await self._execute_query(create_table_query)
 
-    async def is_duplicate(self, event_hash: str) -> bool:
-        query = """
-            SELECT count() 
-            FROM events 
-            WHERE event_hash = %(hash)s
-        """
-        result = await self._execute_query(query, {"hash": event_hash})
-        return result[0][0] > 0
 
-    async def insert_event(self, event_hash: str, event: dict) -> None:
-        if not event_hash:
-            raise ValueError("event_hash must be provided")
+
+    async def insert_batch(self, insert_batch: list) -> None:
+
 
         # Сериализация данных события в JSON
         payload = json.dumps(event, ensure_ascii=False)

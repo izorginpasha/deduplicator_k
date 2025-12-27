@@ -2,14 +2,11 @@ import json
 import hashlib
 import time
 from datetime import datetime
-from redis.asyncio import Redis
-from pybloom_live import ScalableBloomFilter
-from consumer.db.clickhouse_manager import ClickHouseManager
-
+from consumer.db.rocks.Rocks_manager import RocksDedupStore
 
 class Deduplicator:
-    def __init__(self, clickhouse: ClickHouseManager):
-        self.ch = clickhouse
+    def __init__(self, rocks: RocksDedupStore, ):
+        self.rocks = rocks
 
     def _serialize_event(self, event: dict) -> str:
         # Преобразуем все значения datetime в строки ISO 8601
@@ -22,37 +19,20 @@ class Deduplicator:
         event_processed = {k: convert_datetime(v) for k, v in event.items()}
         return json.dumps(event_processed, sort_keys=True)
 
-    def _hash_event(self, event: dict) -> str:
+    def _hash_event(self, event: dict) -> bytes:
         serialized = self._serialize_event(event)
-        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        return hashlib.sha256(serialized.encode("utf-8")).digest()
 
     async def is_duplicate(self, event: dict) -> bool:
+
+        # True  -> дубль
+        # False -> уникально (и мы его зарегистрировали в rocks)
+
         event_hash = self._hash_event(event)
-        # Если в базе данных уже зарегистрирован — дубликат
-        # Асинхронная проверка
-        is_duplicate_in_ch = await self.ch.is_duplicate(event_hash)
-        if is_duplicate_in_ch:
-            # Сразу сохраняем в Redis, если событие найдено в ClickHouse
-            await self.redis.set(event_hash, 1, ex=self.redis_ttl)
-            return True
 
-        await self._register_event(event_hash, event)
+        # Важное: rocks.is_dup_and_touch делает "check + register"
+        # (если уникально — запоминает)
+        return self.rocks.is_dup_and_touch(event_hash)
 
-        return False
 
-    def _cleanup_bloom_filter(self):
 
-        self.bloom = ScalableBloomFilter(mode=ScalableBloomFilter.SMALL_SET_GROWTH)
-        self.last_cleanup_time = time.time()
-
-    async def _register_event(self, event_hash: str, event: dict):
-
-        # Сохраняем в Redis
-        await self.redis.set(event_hash, 1, ex=self.redis_ttl)
-
-        # Добавляем в Bloom-фильтре
-        self.bloom.add(event_hash)
-        print(f"Событие не найдено, регистрируем: {event_hash}")
-
-        # Вставка в ClickHouse
-        await self.ch.insert_event(event_hash, event)
