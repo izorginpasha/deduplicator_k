@@ -1,21 +1,12 @@
 services:
-  redis:
-    container_name: redis
-    image: redis:7
-    ports:
-      - "6379:6379"
-    networks:
-      - app-network
 
   kafka:
     container_name: kafka
-    image: bitnami/kafka:latest
+    image: bitnamilegacy/kafka:latest
     ports:
       - "9092:9092"
     env_file:
       .env
-    depends_on:
-      - redis
     networks:
       - app-network
 
@@ -50,7 +41,6 @@ services:
       .env
     depends_on:
       - kafka
-      - redis
       - clickhouse
     networks:
       - app-network
@@ -61,16 +51,17 @@ services:
       context: .
       dockerfile: Dockerfile
     working_dir: /app
-    command: python consumer/consumer.py
+    command: ["python", "-m", "consumer.consumer"]
     volumes:
       - .:/app
       - rocksdb_data:/var/lib/rocksdb
     env_file:
       .env
     depends_on:
-      - kafka
-      - redis
-      - clickhouse
+      kafka:
+        condition: service_healthy
+      clickhouse:
+          condition: service_healthy
     networks:
       - app-network
 

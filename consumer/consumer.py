@@ -1,10 +1,11 @@
 import asyncio
-import json
-import os
 import signal
 import logging
-
+import os
+import json
+import time
 from aiokafka import AIOKafkaConsumer
+from aiokafka.structs import TopicPartition, OffsetAndMetadata
 from clickhouse_driver import Client
 from dotenv import load_dotenv
 
@@ -26,6 +27,7 @@ CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER")
 CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD")
 CLICKHOUSE_DB = os.getenv("CLICKHOUSE_DB")
 PATH_ROCKS = os.getenv("PATH_ROCKS")
+WINDOW_SECONDS = int(os.getenv("WINDOW_SECONDS"))
 # ─── Настройка логирования ─────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format=f"[{CONSUMER_NAME}] %(message)s")
 logger = logging.getLogger(__name__)
@@ -44,6 +46,7 @@ rocks_store = RocksDedupStore(
     window_seconds=WINDOW_SECONDS,
 )
 
+
 ch_manager = ClickHouseManager(clickhouse_client)
 
 deduplicator = Deduplicator( rocks_store)
@@ -53,15 +56,7 @@ event_queue = asyncio.Queue(maxsize=2000)
 
 
 # ─── Kafka Consumer ────────────────────────────────────────────────────────────
-async def consume():
-
-    consumer = AIOKafkaConsumer(
-        TOPIC,
-        bootstrap_servers=KAFKA_BOOTSTRAP,
-        group_id=GROUP_ID,
-        auto_offset_reset="latest",
-        enable_auto_commit=False,
-    )
+async def consume(consumer: AIOKafkaConsumer):
     await consumer.start()
     logger.info(" Kafka consumer запущен...")
 
@@ -71,14 +66,19 @@ async def consume():
             msg = await consumer.getone()
             # обрабатываем в словарь
             event = json.loads(msg.value.decode())
+            event_hash =  deduplicator.hash_event(event)
             # отправляем в дедубликатор
-            if not await deduplicator.is_duplicate(event):
+
+            if not deduplicator.is_duplicate(event_hash):
+                # добавим хеш в событие для вставки в ClickHouse
+                event["event_hash"] = event_hash.hex()
                 # уникально в очередь на запись в clickhouse
                 await event_queue.put((msg, event))
             else:
-                # Дубликаты коментим, логируем и отбрасываем
-                await consumer.commit()
-                logger.info(f" Дубликат: {event.get('event_id')}")
+                # дубль -> отбрасываем и коммитим сразу ТОЛЬКО этот offset
+                tp = TopicPartition(msg.topic, msg.partition)
+                await consumer.commit({tp: OffsetAndMetadata(msg.offset + 1, "")})
+                logger.info(f"Дубликат: {event.get('event_id')}")
     except Exception as e:
         # Любая ошибка при обработке сообщения
         logger.warning(f" Ошибка при обработке сообщения: {e}")
@@ -93,7 +93,7 @@ async def consume():
 # ─── writer ───────────────────────────────────────────────────────────────
 
 
-async def writer(batch_size=500, flush_interval=0.5):
+async def writer(consumer: AIOKafkaConsumer, batch_size=500, flush_interval=0.5):
     # Буфер для накопления событий перед записью в ClickHouse
     batch = []
     msgs = []  # сообщения для расчёта offsets
@@ -110,10 +110,11 @@ async def writer(batch_size=500, flush_interval=0.5):
         try:
             # Пытаемся получить ОДНО событие из очереди,
             # но не ждём дольше, чем timeout секунд
-            msg, event = await asyncio.wait_for(
+            msg, event= await asyncio.wait_for(
                 event_queue.get(),
                 timeout=max(0, timeout)  # защита от отрицательного таймаута
             )
+
 
             # Добавляем событие в текущий batch
             batch.append(event)
@@ -167,39 +168,79 @@ async def writer(batch_size=500, flush_interval=0.5):
 
 # ─── Точка входа ───────────────────────────────────────────────────────────────
 async def async_main():
-    consumer_task = asyncio.create_task(consume())
-    # worker_tasks = [asyncio.create_task(worker(i)) for i in range(NUM_WORKERS)]
 
-    loop = asyncio.get_running_loop()
+    # Запускаем 2 основные задачи:
+    # - consume(): читает Kafka -> дедуп -> кладёт уникальные события в asyncio.Queue
+    # - writer(): читает из asyncio.Queue -> пишет батчами в ClickHouse -> commit offsets
+    #
+    # Также настраиваем graceful shutdown по SIGINT/SIGTERM.
+    #
 
+    # Event для “мягкого” завершения по сигналу
     stop_event = asyncio.Event()
 
+    # Берём текущий event loop, чтобы подписаться на сигналы ОС
+    loop = asyncio.get_running_loop()
+
     def shutdown():
-        logger.info("🚪 Завершение работы...")
+        # Этот обработчик вызывается при Ctrl+C (SIGINT) или SIGTERM (docker stop)
+        logger.info("🚪 Получен сигнал завершения, начинаем shutdown...")
         stop_event.set()
 
+    # Регистрируем обработчики сигналов
     loop.add_signal_handler(signal.SIGINT, shutdown)
     loop.add_signal_handler(signal.SIGTERM, shutdown)
 
+    consumer = AIOKafkaConsumer(
+        TOPIC,
+        bootstrap_servers=KAFKA_BOOTSTRAP,
+        group_id=GROUP_ID,
+        auto_offset_reset="latest",
+        enable_auto_commit=False,
+    )
+
+    # Запускаем корутины как фоновые задачи
+    consumer_task = asyncio.create_task(consume(consumer), name="kafka-consumer")
+    writer_task = asyncio.create_task(writer(consumer), name="clickhouse-writer")
+
     try:
-        await stop_event.wait()  # Ждём сигнала завершения
+        # Ждём, пока не придёт сигнал остановки
+        await stop_event.wait()
+
+
     finally:
-        logger.info(" Остановка consumer и завершение воркеров...")
+
+        logger.info("🛑 Останавливаем consumer (Kafka чтение прекращается)")
+
         consumer_task.cancel()
+
         try:
+
             await consumer_task
+
         except asyncio.CancelledError:
+
             pass
 
-        # Завершаем очередь: отправим None каждому воркеру
-        for _ in range(NUM_WORKERS):
-            await event_queue.put(None)
+        # Даем writer дописать то, что уже лежит в очереди
 
-        # Ждём завершения очереди
+        logger.info(" Дожидаемся записи очереди в ClickHouse...")
+
         await event_queue.join()
 
-        # # Завершаем воркеры
-        # await asyncio.gather(*worker_tasks, return_exceptions=True)
+        # остановить writer
+
+        logger.info("Останавливаем writer")
+
+        writer_task.cancel()
+
+        try:
+
+            await writer_task
+
+        except asyncio.CancelledError:
+
+            pass
 
         logger.info("🏁 Все задачи завершены")
 
