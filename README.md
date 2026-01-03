@@ -1,170 +1,251 @@
-🎯 Event Deduplication Microservice
+# Deduplicator: Kafka → ClickHouse
 
-### 📌 Назначение
-Микросервис для приёма, фильтрации и хранения уникальных событий, основанный на связке FastAPI, Kafka, Redis, ClickHouse и Bloom-фильтра.
+Сервис обработки событий с дедупликацией и гарантированной записью в ClickHouse.
+
+Проект принимает события через HTTP API, публикует их в Kafka, обрабатывает consumer’ом с дедупликацией и батчевой записью в ClickHouse.  
+Offset’ы Kafka коммитятся **только после успешной записи в БД**.
 
 ---
 
-### ⚙️ Компоненты системы
+## 🧠 Архитектура
 
-#### 1. **FastAPI-приложение (`main.py`)**
-- **Роут:** `POST /event`
-- **Функциональность:** Принимает событие в формате `Event`, генерирует UUID, сериализует событие и отправляет в Kafka.
-- **Kafka Producer:** Инициализируется на старте приложения.
-- **Зависимости:**
-  - `aiokafka.AIOKafkaProducer`
-  - `pydantic.BaseModel`
-  - `.env` с переменной `TOPIC`
-
-#### 2. **Kafka (брокер сообщений)**
-- **Используется как очередь между API и обработчиком событий**
-- **Топик:** По умолчанию `events` (настраивается через `.env`)
-
-#### 3. Consumer (consumer.py)**
-- Kafka Consumer: асинхронно читает события из топика Kafka (aiokafka.AIOKafkaConsumer)**
-- Дедупликация: каждое сообщение проверяется через Deduplicator.is_duplicate(event)
-- Очередь обработки: уникальные события помещаются в асинхронную очередь asyncio.Queue для последующей обработки
-- ClickHouse: при запуске создаётся таблица событий через ClickHouseManager.create_events_table()
-- Логирование: сообщения о дубликатах, ошибках и статусах выводятся в консоль
-🧼 Грейсфул-шатдаун:
-Обработка сигналов SIGINT и SIGTERM
-Остановка Kafka consumer и закрытие Redis-подключения
-Очистка очереди событий и завершение всех задач (в том числе воркеров, если используются)
-
-🔧 ENV-переменные:
-
-env
-Копировать
-Редактировать
-TOPIC=events
-KAFKA_BOOTSTRAP=kafka:9092
-GROUP_ID=events-group
-REDIS_HOST=redis
-CLICKHOUSE_HOST=clickhouse
-CLICKHOUSE_PORT=9000
-CLICKHOUSE_USER=default
-CLICKHOUSE_PASSWORD=my_password
-CLICKHOUSE_DB=default
-
-#### 4. **Deduplicator (`deduplicator.py`)**
-
-- **Назначение:** Класс для дедупликации событий, использующий Redis, Bloom-фильтр и ClickHouse для проверки уникальности событий.
-  
-- **Проверка на дубликаты:**
-  - Метод `is_duplicate(event)`:
-    - Хэширует событие.
-    - Проверяет наличие хэша в Redis.
-    - Проверяет наличие в Bloom-фильтре.
-    - Если событие не найдено в Redis или Bloom-фильтре, проверяет ClickHouse на наличие события.
-    - Если событие найдено в ClickHouse, оно сохраняется в Redis с TTL и добавляется в Bloom-фильтр.
-    - Если событие уникально, оно регистрируется в Redis, Bloom-фильтре и ClickHouse.
-
-- **Управление Bloom-фильтром:** Метод `_cleanup_bloom_filter()` очищает Bloom-фильтр каждый час.
-
-- **Технические детали:**  
-  - Используется библиотека `pybloom_live` для Bloom-фильтра.
-  - Хэширование события осуществляется через `hashlib`.
-  - Сериализация события выполняется в формат JSON с сортировкой ключей.
-  
-- **Параметры и настройки:**
-  - `redis_ttl`: Время жизни ключей в Redis (по умолчанию 2 часа).
-  - Использует асинхронные вызовы для взаимодействия с Redis и ClickHouse.
-
-
-#### 5. **ClickHouseManager (`clickhouse_manager.py`)**
-
-- **Назначение:** Класс-менеджер для работы с базой ClickHouse (обёртка над `clickhouse_driver.Client`).
-- **Создание таблицы:** Метод `create_events_table()` создаёт таблицу `events`, если она ещё не существует.  
-  Таблица:
-  - `event_hash` — хэш события (уникальный ключ)
-  - `event_data` — сериализованное JSON-событие
-  - `created_at` — время поступления события  
-  Удаление старых данных происходит автоматически по TTL: `created_at + 7 дней`.
-  
-- **Проверка на дубликаты:**  
-  Метод `is_duplicate(event_hash)` проверяет, существует ли уже событие с таким хэшем в ClickHouse.
-
-- **Сохранение события:**  
-  Метод `insert_event(event_hash, event)` сериализует событие в JSON и сохраняет его с текущим временем в таблицу `events`.
-
-- **Асинхронность:**  
-  Все запросы выполняются асинхронно с помощью `asyncio.run_in_executor(...)`, поскольку ClickHouse клиент синхронный.
-
- Структура таблицы ClickHouse:
-```sql
-CREATE TABLE IF NOT EXISTS events (
-    event_hash String,
-    event_data String,
-    created_at DateTime
-) ENGINE = MergeTree()
-ORDER BY event_hash
-TTL created_at + INTERVAL 7 DAY
-SETTINGS ttl_only_drop_parts = 1;
 ```
-ENV-переменные:
-env
-Копировать
-Редактировать
-CLICKHOUSE_HOST=clickhouse
-CLICKHOUSE_PORT=9000
-CLICKHOUSE_USER=default
-CLICKHOUSE_PASSWORD=my_password
-CLICKHOUSE_DB=default
+Client / Tests (Locust)
+        │
+        ▼
+     FastAPI
+        │
+        ▼
+      Kafka
+   (events-stream)
+        │
+        ▼
+   Kafka Consumer
+   ├─ Deduplicator (RocksDB)
+   ├─ Batch buffering
+   ├─ ClickHouse insert
+   └─ Commit offsets
+```
 
-## 📊 Результаты Нагрузочного Тестирования
+### Принципы
+- At-least-once delivery
+- Коммит offset’ов **после** записи в ClickHouse
+- Дедупликация событий
+- Батчевые вставки
+- Защита от потери данных при сбоях
 
-### Конфигурация Машины
+---
 
-- **CPU:** 8 × 3.3 ГГц
-- **RAM:** 16 ГБ
-- **NVMe:** 20 ГБ
-- **ОС:** Ubuntu 22.04
+## ⚙️ Технологии
 
-### Результаты Тестирования POST /event
+- Python 3.12
+- FastAPI
+- Kafka (KRaft, Bitnami)
+- aiokafka
+- ClickHouse
+- clickhouse-driver
+- RocksDB
+- Docker / Docker Compose
+- asyncio
+- Locust (нагрузочное тестирование)
 
-| Тип   | Имя       | Количество запросов | Количество ошибок | Медиана (мс) | 95-й персентиль (мс) | 99-й персентиль (мс) | Среднее (мс) | Минимум (мс) | Максимум (мс) | Средний размер (байт) | RPS  | Ошибки/с |
-|-------|-----------|---------------------|-------------------|--------------|----------------------|----------------------|--------------|--------------|---------------|-----------------------|------|----------|
-| POST  | /event    | 232111              | 0                 | 150          | 230                  | 280                  | 162.31       | 101          | 938           | 91                    | 596  | 0        |
-| **Итого** |           | **232111**            | **0**             | **150**      | **230**              | **280**              | **162.31**   | **101**      | **938**       | **91**                | **596**| **0**    |
+---
 
-### Объяснение Метрик:
+## 📂 Структура проекта
 
-- **# Requests (Запросы):** Общее количество выполненных запросов.
-- **# Fails (Ошибки):** Общее количество неудачных запросов.
-- **Median (мс):** Время отклика 50% запросов.
-- **95%ile (мс):** Время отклика для 95% запросов.
-- **99%ile (мс):** Время отклика для 99% запросов.
-- **Avg (мс):** Среднее время отклика для всех запросов.
-- **Min (мс):** Минимальное время отклика.
-- **Max (мс):** Максимальное время отклика.
-- **Avg size (байт):** Средний размер ответа.
-- **RPS (Запросов в секунду):** Среднее количество запросов в секунду.
-- **Failures/s (Ошибок в секунду):** Среднее количество ошибок в секунду.
-
-### Выводы:
-
-- Нагрузочное тестирование показало отличные результаты с **0 ошибками** при **232111** запросах.
-- Время отклика в **99% случаев** не превышает **280 мс**, что свидетельствует о хорошей производительности.
-- Средний размер ответа составляет **91 байт**, что указывает на эффективность обработки запросов.
-тесты проводились по  locust -f locustfile.py --host=http://103.74.93.169:8000                                              
-фаил для тестов locustfile.py в корне проекта
-### 🔄 Поток обработки события
-
-```mermaid
-graph TD
-    A[FastAPI API] -->|POST /event| B(Kafka Topic)
-    B --> C[Kafka Consumer]
-    C --> D{Deduplicator}
-    D -->|уникально| E[Redis + BloomFilter]
-    D -->|уникально| F[ClickHouse]
-    D -->|дубликат| G[skip]
+```
+.
+├── api/                            # HTTP API (FastAPI)
+├── consumer/
+│   ├── consumer.py                # Kafka consumer (batch + dedup + ClickHouse)
+│   ├── deduplicator/
+│   │   └── deduplicator.py        # Hash + RocksDB дедупликация
+│   └── db/
+│       └── clickhouse/
+│           └── clickhouse_manager.py
+├── clickhouse-init-scripts/
+│   └── init_create_database.sql
+├── locustfile.py                  # Нагрузочное тестирование
+├── docker-compose.yml
+├── .env
+└── README.md
 ```
 
 ---
 
+## 🔄 Поток обработки события
 
+1. Клиент отправляет событие в API  
+2. API публикует событие в Kafka (`events-stream`)  
+3. Consumer читает сообщение  
+4. Вычисляется `event_hash`  
+5. Проверка дедупликации (RocksDB)  
+6. Уникальные события накапливаются в batch  
+7. Batch записывается в ClickHouse  
+8. Offset’ы Kafka коммитятся  
+9. Дубликаты отбрасываются и коммитятся сразу  
 
 ---
 
-### 📌 Примечания
-- Все события проверяются по хешу всех ключей предстввленного json, есть в корне проекта
+## 📦 Формат события
+
+```json
+{
+  "event_id": "uuid",
+  "type": "test_event",
+  "payload": { "msg": "hello" }
+}
+```
+
+- `event_id` — уникальный идентификатор события  
+- `event_hash` вычисляется в consumer  
+- `payload` — произвольные данные  
+
+---
+
+## 🗄 ClickHouse
+
+- Вставка выполняется батчами  
+- `event_hash` хранится как `FixedString(32)` (bytes)  
+- Вставка выполняется через `asyncio.to_thread`, так как клиент синхронный  
+
+---
+
+## 🧩 Дедупликация
+
+- Реализована через RocksDB  
+- Ключ — `event_hash`  
+- Sliding window (настраивается)  
+- Повторные события не попадают в ClickHouse  
+
+---
+
+## 🚀 Запуск проекта
+
+### 1. Переменные окружения (`.env`)
+
+```env
+TOPIC=events-stream
+KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+GROUP_ID=events-consumer
+
+CLICKHOUSE_HOST=clickhouse
+CLICKHOUSE_PORT=9000
+CLICKHOUSE_DB=default
+CLICKHOUSE_USER=default
+CLICKHOUSE_PASSWORD=
+
+PATH_ROCKS=/var/lib/rocksdb
+WINDOW_SECONDS=604800
+```
+
+---
+
+### 2. Запуск через Docker Compose
+
+```bash
+docker compose up -d --build
+```
+
+---
+
+### 3. Просмотр логов в реальном времени
+
+```bash
+docker logs -f consumer
+docker logs -f api
+```
+
+---
+
+## 🧪 Ручная отправка события
+
+```python
+import requests
+import uuid
+import time
+
+event = {
+    "event_id": str(uuid.uuid4()),
+    "type": "manual_test",
+    "payload": {"msg": "hello"},
+    "sent_at": int(time.time())
+}
+
+r = requests.post("http://localhost:8000/event", json=event)
+print(r.status_code, r.text)
+```
+
+---
+
+## 🧪 Нагрузочное тестирование (Locust)
+
+В проекте используется `locustfile.py`.
+
+### Запуск с UI
+
+```bash
+pip install locust
+locust -f locustfile.py
+```
+
+Открой в браузере:
+
+```
+http://localhost:8089
+```
+
+### Headless режим
+
+```bash
+locust -f locustfile.py   --headless   -u 200   -r 50   -t 60s   --host http://localhost:8000
+```
+
+---
+
+## 🔍 Отладка
+
+### Проверить, что данные пишутся
+
+```bash
+docker exec -it clickhouse clickhouse-client -q "SELECT count() FROM default.events"
+```
+
+### Типичный лог consumer
+
+```
+есть сообщение
+уникально
+Пишем в ClickHouse batch=1
+Batch записан + offsets committed
+```
+
+---
+
+## ⚠️ Важные моменты
+
+- Offset’ы коммитятся только после успешной вставки  
+- ClickHouse клиент синхронный — нельзя использовать `await`  
+- Для отладки удобно использовать `auto_offset_reset="earliest"`  
+- Один consumer = один writer (batch внутри одного цикла)  
+
+---
+
+## 📌 Roadmap
+
+- Prometheus / Grafana метрики  
+- Dead-letter queue  
+- Retry / backoff для ClickHouse  
+- Масштабирование consumer’ов  
+- Bloom filter перед RocksDB  
+- Структурированные JSON-логи  
+
+---
+
+## ✅ Статус проекта
+
+Проект рабочий.  
+Подходит как:
+- pet-project  
+- MVP  
+- основа для продакшн-сервиса  
