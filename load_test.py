@@ -97,7 +97,7 @@ async def load_test():
         logger.info(f"⌛ Тест завершён по тайм-ауту ({DURATION} секунд).")
         logger.info("✅ Все задачи завершены.")
         logger.info(
-            f"📊 Итоги: RPS: {rps_counter._value.get():.0f} | ✅: {success_counter._value.get():.0f} | ❌: {error_counter._value.get():.0f}")
+            f"Итоги: RPS: {rps_counter._value.get():.0f} | ✅: {success_counter._value.get():.0f} | ❌: {error_counter._value.get():.0f}")
 
 # Вход
 def main():

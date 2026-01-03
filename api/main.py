@@ -8,7 +8,7 @@ from aiokafka import AIOKafkaProducer
 load_dotenv()
 
 EVENT_TOPIC = os.getenv("TOPIC")  # значение по умолчанию
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
 app = FastAPI()
 
 # Kafka продьюсер
@@ -18,7 +18,7 @@ producer: AIOKafkaProducer | None = None
 @app.on_event("startup")
 async def startup_event():
     global producer
-    producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP)  # Используйте правильный адрес
+    producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)  # Используйте правильный адрес
     await producer.start()
     print("🚀 Kafka producer запущен")
 

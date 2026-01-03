@@ -1,33 +1,19 @@
 services:
-  redis:
-    container_name: redis
-    image: redis:7
-    ports:
-      - "6379:6379"
-    networks:
-      - app-network
 
   kafka:
     container_name: kafka
-    image: bitnami/kafka:latest
+    image: bitnamilegacy/kafka:latest
     ports:
       - "9092:9092"
-    environment:
-      - KAFKA_KRAFT_MODE=true
-      - KAFKA_CFG_NODE_ID=1
-      - KAFKA_KRAFT_CLUSTER_ID=m7nU4P5BQNi0nrIHTG8G6Q
-      - KAFKA_CFG_PROCESS_ROLES=broker,controller
-      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
-      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
-      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
-      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
-      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
-      - KAFKA_CFG_LOG_DIRS=/tmp/kraft-combined-logs
-      - ALLOW_PLAINTEXT_LISTENER=yes
-    depends_on:
-      - redis
+    env_file:
+      .env
     networks:
       - app-network
+    healthcheck:
+      test: [ "CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 || exit 1" ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
 
   clickhouse:
     container_name: clickhouse
@@ -35,13 +21,12 @@ services:
     ports:
       - "8123:8123"   # HTTP-интерфейс
       - "9000:9000"   # TCP-интерфейс для клиентов
-    environment:
-      - CLICKHOUSE_USER=default
-      - CLICKHOUSE_PASSWORD=my_password
+    env_file:
+      .env
     ulimits:
       nofile:
-        soft: 262144
-        hard: 262144
+        soft: 262144 #текущий лимит
+        hard: 262144 # потолок
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - ./clickhouse-init-scripts:/docker-entrypoint-initdb.d  # Добавляем путь к скриптам
@@ -57,35 +42,35 @@ services:
       - "8000:8000"
     volumes:
       - .:/app
-    environment:
-      - TOPIC=${TOPIC}
-      - KAFKA_BOOTSTRAP=${KAFKA_BOOTSTRAP}
+    env_file:
+      .env
     depends_on:
       - kafka
-      - redis
       - clickhouse
     networks:
       - app-network
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 
   consumer:
+    container_name: consumer
     build:
       context: .
       dockerfile: Dockerfile
     working_dir: /app
-    command: python consumer/consumer.py
+    command: [ "python", "-m", "consumer.consumer" ]
     volumes:
       - .:/app
-    environment:
-      - CLICKHOUSE_HOST=clickhouse
-      - CLICKHOUSE_USER=default
-      - CLICKHOUSE_PASSWORD=my_password
+      - rocksdb_data:/var/lib/rocksdb
+    env_file:
+      - .env
     depends_on:
-      - kafka
-      - redis
-      - clickhouse
+      kafka:
+        condition: service_healthy
+      clickhouse:
+        condition: service_started
     networks:
       - app-network
+    restart: unless-stopped
 
 networks:
   app-network:
@@ -93,3 +78,4 @@ networks:
 
 volumes:
   clickhouse_data:
+  rocksdb_data:
