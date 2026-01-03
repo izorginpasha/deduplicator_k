@@ -16,7 +16,7 @@ from consumer.db.rocks.rocks_manager import RocksDedupStore
 load_dotenv()
 
 TOPIC = os.getenv("TOPIC")
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP")
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
 REDIS_HOST = os.getenv("REDIS_HOST")
 CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST")
 GROUP_ID = os.getenv("GROUP_ID")
@@ -51,120 +51,177 @@ ch_manager = ClickHouseManager(clickhouse_client)
 
 deduplicator = Deduplicator( rocks_store)
 
-event_queue = asyncio.Queue(maxsize=2000)
+
 
 
 
 # ─── Kafka Consumer ────────────────────────────────────────────────────────────
-async def consume(consumer: AIOKafkaConsumer):
+async def consume(
+    consumer: AIOKafkaConsumer,
+    batch_size: int = 500,
+    flush_interval: float = 5.0,
+):
     await consumer.start()
-    logger.info(" Kafka consumer запущен...")
+    logger.info("Kafka consumer запущен...")
+
+    batch = []
+    msgs = []
+    last_flush = time.monotonic()
+
+    async def flush_batch():
+        nonlocal batch, msgs, last_flush
+        if not batch:
+            return
+
+        logger.info(f"Пишем в ClickHouse batch={len(batch)}")
+        # clickhouse_driver.Client синхронный -> в отдельный поток
+        await asyncio.to_thread(ch_manager.insert_batch, batch)
+
+        # Коммитим offsets только для успешно записанных сообщений
+        offsets = {}
+        for m in msgs:
+            tp = TopicPartition(m.topic, m.partition)
+            next_offset = m.offset + 1
+            prev = offsets.get(tp)
+            if prev is None or next_offset > prev.offset:
+                offsets[tp] = OffsetAndMetadata(next_offset, "")
+
+        await consumer.commit(offsets=offsets)
+
+        batch.clear()
+        msgs.clear()
+        last_flush = time.monotonic()
+        logger.info("Batch записан + offsets committed")
 
     try:
         while True:
-            # получаем сообщение из очереди
-            msg = await consumer.getone()
-            # обрабатываем в словарь
-            event = json.loads(msg.value.decode())
-            event_hash =  deduplicator.hash_event(event)
-            # отправляем в дедубликатор
+            # Ждём сообщение, но не дольше, чем нужно до flush по времени
+            timeout = flush_interval - (time.monotonic() - last_flush)
+            if timeout < 0:
+                timeout = 0
 
-            if not deduplicator.is_duplicate(event_hash):
-                # добавим хеш в событие для вставки в ClickHouse
-                event["event_hash"] = event_hash.hex()
-                # уникально в очередь на запись в clickhouse
-                await event_queue.put((msg, event))
-            else:
-                # дубль -> отбрасываем и коммитим сразу ТОЛЬКО этот offset
+            try:
+                msg = await asyncio.wait_for(consumer.getone(), timeout=timeout)
+            except asyncio.TimeoutError:
+                # Время пришло — пробуем записать накопленное
+                await flush_batch()
+                continue
+
+            event = json.loads(msg.value.decode())
+            event_hash = deduplicator.hash_event(event)
+            logger.info("есть сообщение")
+
+            if deduplicator.is_duplicate(event_hash):
+                logger.info("дубль")
                 tp = TopicPartition(msg.topic, msg.partition)
                 await consumer.commit({tp: OffsetAndMetadata(msg.offset + 1, "")})
                 logger.info(f"Дубликат: {event.get('event_id')}")
-    except Exception as e:
-        # Любая ошибка при обработке сообщения
-        logger.warning(f" Ошибка при обработке сообщения: {e}")
-    except asyncio.CancelledError:
-        # Корректная остановка по сигналу (SIGTERM / shutdown)
-        logger.info(" Получен сигнал остановки")
-    finally:
-        # Корректно закрываем Kafka consumer
-        await consumer.stop()
-        logger.info("Kafka consumer закрыт")
+                continue
 
-# ─── writer ───────────────────────────────────────────────────────────────
+            # Уникальное
+            event["event_hash"] = event_hash
+            logger.info("уникально")
 
-
-async def writer(consumer: AIOKafkaConsumer, batch_size=500, flush_interval=0.5):
-    # Буфер для накопления событий перед записью в ClickHouse
-    batch = []
-    msgs = []  # сообщения для расчёта offsets
-
-    # Время последней записи (flush)
-    # Используем monotonic(), чтобы не зависеть от изменения системного времени
-    last_flush = time.monotonic()
-
-    while True:
-        # Сколько ещё можно ждать новое событие,
-        # прежде чем нужно сделать принудительный flush по времени
-        timeout = flush_interval - (time.monotonic() - last_flush)
-
-        try:
-            # Пытаемся получить ОДНО событие из очереди,
-            # но не ждём дольше, чем timeout секунд
-            msg, event= await asyncio.wait_for(
-                event_queue.get(),
-                timeout=max(0, timeout)  # защита от отрицательного таймаута
-            )
-
-
-            # Добавляем событие в текущий batch
             batch.append(event)
             msgs.append(msg)
 
-            # Сообщаем очереди, что элемент успешно обработан
-            event_queue.task_done()
+            # flush по размеру
+            if len(batch) >= batch_size:
+                await flush_batch()
 
-        except asyncio.TimeoutError:
-            # Таймаут — это НЕ ошибка.
-            # Он означает, что за отведённое время
-            # новые события не пришли.
-            pass
+    except asyncio.CancelledError:
+        logger.info("Получен сигнал остановки")
+        # при остановке — дописываем то, что накопили
+        try:
+            await flush_batch()
+        except Exception:
+            logger.exception("Не удалось дописать batch при shutdown (offsets не закоммичены)")
 
-        # Условие записи batch в ClickHouse:
-        # 1) накопили batch_size событий
-        # ИЛИ
-        # 2) прошло flush_interval секунд с последней записи
-        if batch and (
-            len(batch) >= batch_size
-            or (time.monotonic() - last_flush) >= flush_interval
-        ):
-            try:
-                # 1) Пишем батч в ClickHouse
-                await ch_manager.insert_batch(batch)
+    except Exception as e:
+        logger.exception(f"Ошибка в consumer loop: {e}")
 
-                # 2) Готовим offsets только для записанных сообщений
-                offsets = {}
-                for m in msgs:
-                    tp = TopicPartition(m.topic, m.partition)
-                    next_offset = m.offset + 1
-
-                    prev = offsets.get(tp)
-                    if prev is None or next_offset > prev.offset:
-                        offsets[tp] = OffsetAndMetadata(next_offset, "")
-
-                # 3) Коммитим offsets ПОСЛЕ успешной вставки
-                await consumer.commit(offsets=offsets)
-
-                # 4) Очищаем buffers только после успеха
-                batch.clear()
-                msgs.clear()
-                last_flush = time.monotonic()
-
-            except Exception as e:
-                # Не коммитим! Пусть Kafka переотдаст.
-                # batch и msgs оставляем, чтобы попробовать вставить снова.
-                logger.exception(f"ClickHouse insert/commit failed (no commit): {e}")
-                # можно добавить backoff:
-                await asyncio.sleep(0.2)
+    finally:
+        await consumer.stop()
+#         logger.info("Kafka consumer закрыт")
+#
+# # ─── writer ───────────────────────────────────────────────────────────────
+#
+#
+# async def writer(consumer: AIOKafkaConsumer, batch_size=500, flush_interval=5):
+#     # Буфер для накопления событий перед записью в ClickHouse
+#     batch = []
+#     msgs = []  # сообщения для расчёта offsets
+#
+#     # Время последней записи (flush)
+#     # Используем monotonic(), чтобы не зависеть от изменения системного времени
+#     last_flush = time.monotonic()
+#     logger.info("чтец запущен")
+#
+#     while True:
+#         # Сколько ещё можно ждать новое событие,
+#         # прежде чем нужно сделать принудительный flush по времени
+#         timeout = flush_interval - (time.monotonic() - last_flush)
+#
+#         try:
+#             # Пытаемся получить ОДНО событие из очереди,
+#             # но не ждём дольше, чем timeout секунд
+#             msg, event= await asyncio.wait_for(
+#                 event_queue.get(),
+#                 timeout=max(0, timeout)  # защита от отрицательного таймаута
+#             )
+#
+#
+#             # Добавляем событие в текущий batch
+#             logger.info("добавляем событие в пачку")
+#             batch.append(event)
+#             msgs.append(msg)
+#
+#             # Сообщаем очереди, что элемент успешно обработан
+#             event_queue.task_done()
+#
+#         except asyncio.TimeoutError:
+#             # Таймаут — это НЕ ошибка.
+#             # Он означает, что за отведённое время
+#             # новые события не пришли.
+#             pass
+#
+#         # Условие записи batch в ClickHouse:
+#         # 1) накопили batch_size событий
+#         # ИЛИ
+#         # 2) прошло flush_interval секунд с последней записи
+#         if batch and (
+#             len(batch) >= batch_size
+#             or (time.monotonic() - last_flush) >= flush_interval
+#         ):
+#             try:
+#                 # 1) Пишем батч в ClickHouse
+#                 logger.info("пишем в бд пачку")
+#                 await ch_manager.insert_batch(batch)
+#
+#                 # 2) Готовим offsets только для записанных сообщений
+#                 offsets = {}
+#                 for m in msgs:
+#                     tp = TopicPartition(m.topic, m.partition)
+#                     next_offset = m.offset + 1
+#
+#                     prev = offsets.get(tp)
+#                     if prev is None or next_offset > prev.offset:
+#                         offsets[tp] = OffsetAndMetadata(next_offset, "")
+#
+#                 # 3) Коммитим offsets ПОСЛЕ успешной вставки
+#                 await consumer.commit(offsets=offsets)
+#
+#                 # 4) Очищаем buffers только после успеха
+#                 batch.clear()
+#                 msgs.clear()
+#                 last_flush = time.monotonic()
+#
+#             except Exception as e:
+#                 # Не коммитим! Пусть Kafka переотдаст.
+#                 # batch и msgs оставляем, чтобы попробовать вставить снова.
+#                 logger.exception(f"ClickHouse insert/commit failed (no commit): {e}")
+#                 # можно добавить backoff:
+#                 await asyncio.sleep(0.2)
 
 # ─── Точка входа ───────────────────────────────────────────────────────────────
 async def async_main():
@@ -191,6 +248,14 @@ async def async_main():
     loop.add_signal_handler(signal.SIGINT, shutdown)
     loop.add_signal_handler(signal.SIGTERM, shutdown)
 
+    def log_task_result(t: asyncio.Task):
+        try:
+            t.result()
+        except asyncio.CancelledError:
+            logger.warning(f"Task {t.get_name()} cancelled")
+        except Exception:
+            logger.exception(f"Task {t.get_name()} crashed")
+
     consumer = AIOKafkaConsumer(
         TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP,
@@ -201,8 +266,13 @@ async def async_main():
 
     # Запускаем корутины как фоновые задачи
     consumer_task = asyncio.create_task(consume(consumer), name="kafka-consumer")
-    writer_task = asyncio.create_task(writer(consumer), name="clickhouse-writer")
 
+    logger.info(f"tasks: consumer={consumer_task!r}")
+
+    consumer_task.add_done_callback(log_task_result)
+
+
+    logger.info("Обе задачи созданы: consume ")
     try:
         # Ждём, пока не придёт сигнал остановки
         await stop_event.wait()
@@ -226,21 +296,11 @@ async def async_main():
 
         logger.info(" Дожидаемся записи очереди в ClickHouse...")
 
-        await event_queue.join()
 
-        # остановить writer
 
-        logger.info("Останавливаем writer")
 
-        writer_task.cancel()
 
-        try:
 
-            await writer_task
-
-        except asyncio.CancelledError:
-
-            pass
 
         logger.info("🏁 Все задачи завершены")
 

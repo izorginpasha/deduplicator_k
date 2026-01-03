@@ -17,7 +17,8 @@ class EventUser(HttpUser):
         event = dict(random.choice(events_data))  # важно: копируем
 
         # если нужно, чтобы не было дедупа на одинаковых событиях:
-        event["event_id"] = str(uuid.uuid4())
+        event_id = str(uuid.uuid4())
+        event["event_id"] = event_id
         event["sent_at"] = int(time.time())
 
         with self.client.post("/event", json=event, name="/event", catch_response=True) as response:

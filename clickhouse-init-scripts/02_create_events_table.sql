@@ -6,3 +6,4 @@ CREATE TABLE IF NOT EXISTS events.events
 )
 ENGINE = MergeTree
 ORDER BY (event_time, event_hash);
+

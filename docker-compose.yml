@@ -9,6 +9,11 @@ services:
       .env
     networks:
       - app-network
+    healthcheck:
+      test: [ "CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 || exit 1" ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
 
   clickhouse:
     container_name: clickhouse
@@ -47,23 +52,25 @@ services:
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 
   consumer:
+    container_name: consumer
     build:
       context: .
       dockerfile: Dockerfile
     working_dir: /app
-    command: ["python", "-m", "consumer.consumer"]
+    command: [ "python", "-m", "consumer.consumer" ]
     volumes:
       - .:/app
       - rocksdb_data:/var/lib/rocksdb
     env_file:
-      .env
+      - .env
     depends_on:
       kafka:
         condition: service_healthy
       clickhouse:
-          condition: service_healthy
+        condition: service_started
     networks:
       - app-network
+    restart: unless-stopped
 
 networks:
   app-network:
