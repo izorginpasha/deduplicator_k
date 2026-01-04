@@ -8,6 +8,8 @@ from aiokafka import AIOKafkaConsumer
 from aiokafka.structs import TopicPartition, OffsetAndMetadata
 from clickhouse_driver import Client
 from dotenv import load_dotenv
+from aiokafka.errors import KafkaError
+import random
 
 from consumer.deduplicator.deduplicator import Deduplicator
 from consumer.db.clickhouse.clickhouse_manager import ClickHouseManager
@@ -56,6 +58,46 @@ deduplicator = Deduplicator( rocks_store)
 
 
 # ─── Kafka Consumer ────────────────────────────────────────────────────────────
+# создание Kafka Consumer
+def make_consumer() -> AIOKafkaConsumer:
+    return AIOKafkaConsumer(
+        TOPIC,
+        bootstrap_servers=KAFKA_BOOTSTRAP,
+        group_id=GROUP_ID,
+        auto_offset_reset="earliest",
+        enable_auto_commit=False,# коминтим после успешнои записи или отброса дубля
+        # настройки стабильности:
+        session_timeout_ms=30000,
+        heartbeat_interval_ms=10000,
+        max_poll_interval_ms=10 * 60 * 1000,  # если ClickHouse иногда тормозит
+        request_timeout_ms=60000,
+    )
+# запуск и перезапуск при падении
+async def run_consumer_forever(stop_event: asyncio.Event):
+    backoff = 1.0
+
+    while not stop_event.is_set():
+        consumer = make_consumer()
+        try:
+            await consume(consumer)  # твоя функция
+            # если consume вышел сам — это уже подозрительно
+            logger.error("consume() завершился без stop_event — перезапуск")
+        except asyncio.CancelledError:
+            raise
+        except KafkaError:
+            logger.exception("KafkaError: consumer будет перезапущен")
+        except Exception:
+            logger.exception("Unexpected error: consumer будет перезапущен")
+        finally:
+            try:
+                await consumer.stop()
+            except Exception:
+                pass
+
+        # backoff, чтобы не долбиться в бесконечном цикле
+        await asyncio.sleep(backoff + random.random())
+        backoff = min(backoff * 2, 30.0)
+# сам обработчик очереди
 async def consume(
     consumer: AIOKafkaConsumer,
     batch_size: int = 500,
@@ -71,6 +113,8 @@ async def consume(
     async def flush_batch():
         nonlocal batch, msgs, last_flush
         if not batch:
+            # чтобы таймер не уходил в 0 и не начинался busy-loop
+            last_flush = time.monotonic()
             return
 
         logger.info(f"Пишем в ClickHouse batch={len(batch)}")
@@ -103,7 +147,10 @@ async def consume(
             try:
                 msg = await asyncio.wait_for(consumer.getone(), timeout=timeout)
             except asyncio.TimeoutError:
-                # Время пришло — пробуем записать накопленное
+                #  записать накопленное
+                if not batch:
+                    logger.info("⏳ Очередь пуста, жду сообщения...")
+                    await asyncio.sleep(0.2)
                 await flush_batch()
                 continue
 
@@ -141,97 +188,14 @@ async def consume(
         logger.exception(f"Ошибка в consumer loop: {e}")
 
     finally:
+        logger.error("CONSUME EXITED")
         await consumer.stop()
-#         logger.info("Kafka consumer закрыт")
+        logger.info("Kafka consumer закрыт")
 #
-# # ─── writer ───────────────────────────────────────────────────────────────
-#
-#
-# async def writer(consumer: AIOKafkaConsumer, batch_size=500, flush_interval=5):
-#     # Буфер для накопления событий перед записью в ClickHouse
-#     batch = []
-#     msgs = []  # сообщения для расчёта offsets
-#
-#     # Время последней записи (flush)
-#     # Используем monotonic(), чтобы не зависеть от изменения системного времени
-#     last_flush = time.monotonic()
-#     logger.info("чтец запущен")
-#
-#     while True:
-#         # Сколько ещё можно ждать новое событие,
-#         # прежде чем нужно сделать принудительный flush по времени
-#         timeout = flush_interval - (time.monotonic() - last_flush)
-#
-#         try:
-#             # Пытаемся получить ОДНО событие из очереди,
-#             # но не ждём дольше, чем timeout секунд
-#             msg, event= await asyncio.wait_for(
-#                 event_queue.get(),
-#                 timeout=max(0, timeout)  # защита от отрицательного таймаута
-#             )
-#
-#
-#             # Добавляем событие в текущий batch
-#             logger.info("добавляем событие в пачку")
-#             batch.append(event)
-#             msgs.append(msg)
-#
-#             # Сообщаем очереди, что элемент успешно обработан
-#             event_queue.task_done()
-#
-#         except asyncio.TimeoutError:
-#             # Таймаут — это НЕ ошибка.
-#             # Он означает, что за отведённое время
-#             # новые события не пришли.
-#             pass
-#
-#         # Условие записи batch в ClickHouse:
-#         # 1) накопили batch_size событий
-#         # ИЛИ
-#         # 2) прошло flush_interval секунд с последней записи
-#         if batch and (
-#             len(batch) >= batch_size
-#             or (time.monotonic() - last_flush) >= flush_interval
-#         ):
-#             try:
-#                 # 1) Пишем батч в ClickHouse
-#                 logger.info("пишем в бд пачку")
-#                 await ch_manager.insert_batch(batch)
-#
-#                 # 2) Готовим offsets только для записанных сообщений
-#                 offsets = {}
-#                 for m in msgs:
-#                     tp = TopicPartition(m.topic, m.partition)
-#                     next_offset = m.offset + 1
-#
-#                     prev = offsets.get(tp)
-#                     if prev is None or next_offset > prev.offset:
-#                         offsets[tp] = OffsetAndMetadata(next_offset, "")
-#
-#                 # 3) Коммитим offsets ПОСЛЕ успешной вставки
-#                 await consumer.commit(offsets=offsets)
-#
-#                 # 4) Очищаем buffers только после успеха
-#                 batch.clear()
-#                 msgs.clear()
-#                 last_flush = time.monotonic()
-#
-#             except Exception as e:
-#                 # Не коммитим! Пусть Kafka переотдаст.
-#                 # batch и msgs оставляем, чтобы попробовать вставить снова.
-#                 logger.exception(f"ClickHouse insert/commit failed (no commit): {e}")
-#                 # можно добавить backoff:
-#                 await asyncio.sleep(0.2)
 
 # ─── Точка входа ───────────────────────────────────────────────────────────────
 async def async_main():
 
-    # Запускаем 2 основные задачи:
-    # - consume(): читает Kafka -> дедуп -> кладёт уникальные события в asyncio.Queue
-    # - writer(): читает из asyncio.Queue -> пишет батчами в ClickHouse -> commit offsets
-    #
-    # Также настраиваем graceful shutdown по SIGINT/SIGTERM.
-    #
 
     # Event для “мягкого” завершения по сигналу
     stop_event = asyncio.Event()
@@ -256,23 +220,16 @@ async def async_main():
         except Exception:
             logger.exception(f"Task {t.get_name()} crashed")
 
-    consumer = AIOKafkaConsumer(
-        TOPIC,
-        bootstrap_servers=KAFKA_BOOTSTRAP,
-        group_id=GROUP_ID,
-        auto_offset_reset="latest",
-        enable_auto_commit=False,
-    )
 
-    # Запускаем корутины как фоновые задачи
-    consumer_task = asyncio.create_task(consume(consumer), name="kafka-consumer")
+    # Запуск корутины
+    consumer_task = asyncio.create_task(run_consumer_forever(stop_event), name="kafka-consumer")
 
     logger.info(f"tasks: consumer={consumer_task!r}")
 
     consumer_task.add_done_callback(log_task_result)
 
 
-    logger.info("Обе задачи созданы: consume ")
+    logger.info(" задачи созданы: consume ")
     try:
         # Ждём, пока не придёт сигнал остановки
         await stop_event.wait()

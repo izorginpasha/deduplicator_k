@@ -3,7 +3,7 @@ import time
 import uuid
 
 event = {
-    "event_id": 1,
+    "event_id": 5,
     "type": "manual_python_test",
     "payload": {"msg": "hello from python"},
     "sent_at": 1

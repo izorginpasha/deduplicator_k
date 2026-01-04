@@ -5,7 +5,7 @@ import uuid
 import time
 from locust import HttpUser, task, between
 
-with open("../results-1743680955719.json", "r", encoding="utf-8") as f:
+with open("results-1743680955719.json", "r", encoding="utf-8") as f:
     events_data = json.load(f)
 
 class EventUser(HttpUser):
